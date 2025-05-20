@@ -549,19 +549,19 @@ void Window::paint_compute_pipeline_gui()
                         update_settings_and_rerun_pipeline();
                     }
                 } else if (m_compute_pipeline_settings.model_type == compute::nodes::ComputeAvalancheTrajectoriesNode::PhysicsModelType::PHYSICS_LESS_SIMPLE) {
-                    ImGui::SliderFloat("Gravity##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.gravity, 0.0f, 15.0f, "%.2f");
+                    ImGui::SliderFloat("Slab Thickness##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.slab_thickness, 0.1f, 2.0f, "%.2f");
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         update_settings_and_rerun_pipeline();
                     }
-                    ImGui::SliderFloat("Mass##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.mass, 0.0f, 100.0f, "%.2f");
-                    if (ImGui::IsItemDeactivatedAfterEdit()) {
-                        update_settings_and_rerun_pipeline();
-                    }
-                    ImGui::SliderFloat("Drag coeff##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.drag_coeff, 1.0f, 10000.0f, "%.0f");
+                    ImGui::SliderFloat("Density##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.density, 50.0f, 800.0f, "%.0f");
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         update_settings_and_rerun_pipeline();
                     }
                     ImGui::SliderFloat("Friction coeff##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.friction_coeff, 0.0f, 1.0f, "%.2f");
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        update_settings_and_rerun_pipeline();
+                    }
+                    ImGui::SliderFloat("Drag coeff##model_less_simple", &m_compute_pipeline_settings.model_less_simple_params.drag_coeff, 1.0f, 10000.0f, "%.0f");
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         update_settings_and_rerun_pipeline();
                     }
@@ -652,11 +652,11 @@ void Window::paint_compute_pipeline_gui()
                         update_settings_and_rerun_pipeline();
                     }
                 } else if (m_compute_pipeline_settings.model_type == compute::nodes::ComputeAvalancheTrajectoriesNode::PhysicsModelType::PHYSICS_LESS_SIMPLE) {
-                    ImGui::SliderFloat("Gravity##model2", &m_compute_pipeline_settings.model_less_simple_params.gravity, 0.0f, 15.0f, "%.2f");
+                    ImGui::SliderFloat("Gravity##model2", &m_compute_pipeline_settings.model_less_simple_params.slab_thickness, 0.0f, 15.0f, "%.2f");
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         update_settings_and_rerun_pipeline();
                     }
-                    ImGui::SliderFloat("Mass##model2", &m_compute_pipeline_settings.model_less_simple_params.mass, 0.0f, 100.0f, "%.2f");
+                    ImGui::SliderFloat("Mass##model2", &m_compute_pipeline_settings.model_less_simple_params.density, 0.0f, 100.0f, "%.2f");
                     if (ImGui::IsItemDeactivatedAfterEdit()) {
                         update_settings_and_rerun_pipeline();
                     }
@@ -961,7 +961,7 @@ void Window::update_compute_pipeline_settings()
         trajectory_settings.active_model = m_compute_pipeline_settings.model_type;
         trajectory_settings.model2 = m_compute_pipeline_settings.model_less_simple_params;
         trajectory_settings.active_runout_model = compute::nodes::ComputeAvalancheTrajectoriesNode::FrictionModelType(m_compute_pipeline_settings.friction_model_type);
-        trajectory_settings.runout_perla = m_compute_pipeline_settings.perla;
+        // trajectory_settings.runout_perla = m_compute_pipeline_settings.perla;
         trajectory_settings.runout_flowpy.alpha = glm::radians(m_compute_pipeline_settings.runout_flowpy_alpha);
 
         auto& trajectories_node = m_compute_graph->get_node_as<compute::nodes::ComputeAvalancheTrajectoriesNode>("compute_avalanche_trajectories_node");
@@ -1009,7 +1009,7 @@ void Window::update_compute_pipeline_settings()
         trajectory_settings.active_model = m_compute_pipeline_settings.model_type;
         trajectory_settings.model2 = m_compute_pipeline_settings.model_less_simple_params;
         trajectory_settings.active_runout_model = compute::nodes::ComputeAvalancheTrajectoriesNode::FrictionModelType(m_compute_pipeline_settings.friction_model_type);
-        trajectory_settings.runout_perla = m_compute_pipeline_settings.perla;
+        // trajectory_settings.runout_perla = m_compute_pipeline_settings.perla;
         trajectory_settings.runout_flowpy.alpha = glm::radians(m_compute_pipeline_settings.runout_flowpy_alpha);
 
         auto& trajectories_node = m_compute_graph->get_node_as<compute::nodes::ComputeAvalancheTrajectoriesNode>("compute_avalanche_trajectories_node");
@@ -1097,23 +1097,23 @@ void Window::init_compute_pipeline_presets()
     ComputePipelineSettings default_values;
     ComputePipelineSettings preset_a = {
         .target_region = {}, // select tiles node
-        .zoomlevel = 18,
+        .zoomlevel = 15,
         .num_steps = 512u,
         .step_length = 0.1f,
         .sync_snow_settings_with_render_settings = true, // snow node
         .snow_settings = compute::nodes::ComputeSnowNode::SnowSettings(), // snow node
         .release_point_interval = 16, // trajectories node
-        .perla = {},
+        // .perla = {},
     };
     ComputePipelineSettings preset_b = {
         .target_region = {}, // select tiles node
-        .zoomlevel = 18,
+        .zoomlevel = 15,
         .num_steps = 2048u,
         .step_length = 0.1f,
         .sync_snow_settings_with_render_settings = true, // snow node
         .snow_settings = compute::nodes::ComputeSnowNode::SnowSettings(), // snow node
         .release_point_interval = 16, // trajectories node
-        .perla = {},
+        // .perla = {},
     };
 
     m_compute_pipeline_presets.push_back(default_values);

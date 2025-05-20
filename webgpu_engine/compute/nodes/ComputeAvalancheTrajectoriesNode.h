@@ -54,8 +54,8 @@ public:
     };
 
     struct ModelPhysicsLessSimpleParams {
-        float gravity = 9.81f;
-        float mass = 10.0f;
+        float slab_thickness = 0.5f;
+        float density = 200.0f;
         float friction_coeff = 0.155f;
         float drag_coeff = 4000.f;
     };

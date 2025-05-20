@@ -43,6 +43,13 @@ void ComputePipelineSettings::write_to_json_file(const ComputePipelineSettings& 
     object["alpha"] = settings.runout_flowpy_alpha;
 
     object["trajectory_resolution_multiplier"] = qint64(settings.trajectory_resolution_multiplier);
+    object["model_type"] = qint64(settings.model_type);
+
+    object["friction_model"] = qint64(settings.friction_model_type);
+    object["friction_coeff"] = settings.model_less_simple_params.friction_coeff;
+    object["drag_coeff"] = settings.model_less_simple_params.drag_coeff;
+    object["slab_thickness"] = settings.model_less_simple_params.slab_thickness;
+    object["density"] = settings.model_less_simple_params.density;
 
     QJsonDocument doc;
     doc.setObject(object);
@@ -82,6 +89,14 @@ ComputePipelineSettings ComputePipelineSettings::read_from_json_file(const std::
     settings.random_contribution = float(object["random_contribution"].toDouble());
     settings.persistence_contribution = float(object["persistence_contribution"].toDouble());
     settings.runout_flowpy_alpha = float(object["alpha"].toDouble());
+
+    settings.model_type = static_cast<compute::nodes::ComputeAvalancheTrajectoriesNode::PhysicsModelType>(int(object["model_type"].toInteger()));
+
+    settings.friction_model_type = int(object["friction_model"].toInteger());
+    settings.model_less_simple_params.friction_coeff = float(object["friction_coeff"].toDouble());
+    settings.model_less_simple_params.drag_coeff = float(object["drag_coeff"].toDouble());
+    settings.model_less_simple_params.slab_thickness = float(object["slab_thickness"].toDouble());
+    settings.model_less_simple_params.density = float(object["density"].toDouble());
 
     settings.trajectory_resolution_multiplier = uint32_t(object["trajectory_resolution_multiplier"].toInteger());
     return settings;

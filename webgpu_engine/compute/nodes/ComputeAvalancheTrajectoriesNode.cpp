@@ -66,8 +66,8 @@ void ComputeAvalancheTrajectoriesNode::update_gpu_settings()
     m_settings_uniform.data.physics_model_type = m_settings.active_model;
     m_settings_uniform.data.model1_linear_drag_coeff = m_settings.model1.slowdown_coefficient;
     m_settings_uniform.data.model1_downward_acceleration_coeff = m_settings.model1.speedup_coefficient;
-    m_settings_uniform.data.model2_gravity = m_settings.model2.gravity;
-    m_settings_uniform.data.model2_mass = m_settings.model2.mass;
+    m_settings_uniform.data.model2_gravity = m_settings.model2.slab_thickness;
+    m_settings_uniform.data.model2_mass = m_settings.model2.density;
     m_settings_uniform.data.model2_friction_coeff = m_settings.model2.friction_coeff;
     m_settings_uniform.data.model2_drag_coeff = m_settings.model2.drag_coeff;
 
