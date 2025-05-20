@@ -149,23 +149,23 @@ fn draw_line_pos(start_pos: vec2u, end_pos: vec2u, value: f32, z_delta: f32, tra
     while (true) {
         let buffer_index = u32(y) * settings.output_resolution.x + u32(x);
         atomicMax(&output_storage_buffer[buffer_index], range_to_u32(value, U32_ENCODING_RANGE_NORM)); // map value from [0,1] angle to [0, 2^32 - 1]
-//        if (settings.layer1_zdelta_enabled != 0) {
-//            atomicMax(&output_layer1_zdelta[buffer_index], u32(z_delta)); // zdelta in m (we lose some precision here)
-//        }
-//        if (settings.layer2_cellCounts_enabled != 0) {
-//            atomicAdd(&output_layer2_cellCounts[buffer_index], 1); // count number of steps in this layer
-//        }
-//        if (settings.layer3_travelLength_enabled != 0) {
-//            atomicMax(&output_layer3_travelLength[buffer_index], u32(travel_length)); // travel length in m (we lose some precision here)
-//        }
-//        if (settings.layer4_travelAngle_enabled != 0) {
-//            let travel_angle_value: f32 = degrees(travel_angle); // travel angle in deg (we lose some precision here)
-//            atomicMax(&output_layer4_travelAngle[buffer_index], u32(travel_angle_value));
-//        }
-//        if (settings.layer5_altitudeDifference_enabled != 0) {
-//            atomicMax(&output_layer5_altitudeDifference[buffer_index], u32(altitude_difference));
-//        }
-        //write_pixel_at_pos(vec2u(u32(x), u32(y)), value);
+        if (settings.layer1_zdelta_enabled != 0) {
+            atomicMax(&output_layer1_zdelta[buffer_index], u32(z_delta)); // zdelta in m (we lose some precision here)
+        }
+        if (settings.layer2_cellCounts_enabled != 0) {
+            atomicAdd(&output_layer2_cellCounts[buffer_index], 1); // count number of steps in this layer
+        }
+        if (settings.layer3_travelLength_enabled != 0) {
+            atomicMax(&output_layer3_travelLength[buffer_index], u32(travel_length)); // travel length in m (we lose some precision here)
+        }
+        if (settings.layer4_travelAngle_enabled != 0) {
+            let travel_angle_value: f32 = degrees(travel_angle); // travel angle in deg (we lose some precision here)
+            atomicMax(&output_layer4_travelAngle[buffer_index], u32(travel_angle_value));
+        }
+        if (settings.layer5_altitudeDifference_enabled != 0) {
+            atomicMax(&output_layer5_altitudeDifference[buffer_index], u32(altitude_difference));
+        }
+        write_pixel_at_pos(vec2u(u32(x), u32(y)), value);
         
         if (x == i32(end_pos.x) && y == i32(end_pos.y)) {
             break;
@@ -217,8 +217,6 @@ fn trajectory_overlay(id: vec3<u32>) {
 
     let start_slope_angle = get_slope_angle(start_normal);
     let trajectory_value = start_slope_angle / (PI / 2);
-    var perla_velocity = 0.0f;
-    var perla_theta = 0.0f;
 
     // alpha-beta model state
     let start_point_height: f32 = sample_height_texture(uv);
@@ -232,6 +230,8 @@ fn trajectory_overlay(id: vec3<u32>) {
 
     var acceleration_tangential =  acceleration_gravity - g * start_normal.z * start_normal;
     var dt = sqrt(2 * dx / length(acceleration_tangential));
+    var z_delta = 0f;
+    var last_dir = vec2f(0, 0);
 
     for (var i: u32 = 0; i < settings.num_steps; i++) {
         // compute uv coordinates for current position
@@ -259,9 +259,16 @@ fn trajectory_overlay(id: vec3<u32>) {
             let height_difference = start_point_height - current_height;
             let z_alpha = tan(settings.runout_flowpy_alpha) * world_space_travel_distance;
             let z_gamma = height_difference;
-            let z_delta = length(velocity);
+            z_delta = z_gamma - z_alpha;
             let gamma = atan(height_difference / world_space_travel_distance); // will always be positive -> [ 0 , PI/2 ]
             let delta = gamma - settings.runout_flowpy_alpha;
+            // evaluate runout model, terminate, if necessary
+            if (settings.model_type == 0) {
+                // more info: https://docs.avaframe.org/en/latest/theoryCom4FlowPy.html
+                if (z_delta <= 0) {
+                    break;
+                }
+            }
 
             // draw line from last to current position
             draw_line_uv(last_uv, current_uv, trajectory_value, z_delta, world_space_travel_distance, gamma, height_difference);
@@ -270,14 +277,20 @@ fn trajectory_overlay(id: vec3<u32>) {
 
         // sample normal and get new world space offset based on chosen model
         if (settings.model_type == 0) {
-            let n_l = normalize(normal * (1 - settings.random_contribution) + (rand3() * 2 - 1) * settings.random_contribution);  // n_l     ...  local normal with random offset
-            normal_t = normalize(n_l * (1 - settings.persistence_contribution) + normal_t * settings.persistence_contribution);   // normal_t ... local normal with random offset from last step
-            let gradient = normalize(normal_t.xy);
-            // ToDo step length factor remove -> put into gui
-            world_space_offset = world_space_offset + settings.step_length * 5.0 * gradient.xy;
-            world_space_travel_distance += length(settings.step_length * 5.0 * gradient.xy);
+            let perturbed_normal: vec3f = normalize(normal * (1 - settings.random_contribution) + (rand3() * 2 - 1) * settings.random_contribution);
+            let perturbed_normal_2d: vec2f = perturbed_normal.xy;
+            let scaled_last_dir: vec2f = last_dir * sqrt(z_delta / (2*9.81)) * settings.persistence_contribution;
+            let this_dir: vec2f = perturbed_normal_2d + scaled_last_dir;
+            if (this_dir.x + this_dir.y == 0) { //check potential 0-division before normalization
+                break;
+            }
+            let normalized_this_dir = normalize(this_dir);
+            last_dir = normalized_this_dir;
+
+            world_space_offset = world_space_offset + settings.step_length * 5.0 * normalized_this_dir.xy;
+            world_space_travel_distance += length(settings.step_length * 5.0 * normalized_this_dir.xy);
         } else if (settings.model_type == 1) {
-            let acceleration_normal = -g * normal.z * normal;
+            let acceleration_normal = g * normal.z * normal;
             let acceleration_tangential = acceleration_gravity + acceleration_normal;
             // estimate optimal timestep
             dt = cfl * dx / length(velocity + acceleration_tangential * dt);
@@ -285,6 +298,9 @@ fn trajectory_overlay(id: vec3<u32>) {
             velocity = velocity + acceleration_tangential * dt;
 
             let acceleration_friction = acceleration_by_friction(acceleration_normal, mass_per_area, velocity);
+            if(length(velocity) < length(acceleration_friction) * dt){
+            break;
+            }
             velocity = velocity + acceleration_friction * dt;
 
             //    let f_weight = mass * gravity;
