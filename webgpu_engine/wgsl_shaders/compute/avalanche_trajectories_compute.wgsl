@@ -199,6 +199,9 @@ fn trajectory_overlay(id: vec3<u32>) {
     let pixel_size = vec2f(settings.region_size) / vec2f(textureDimensions(input_normal_texture));
     let dx = min(pixel_size.x, pixel_size.y);
 
+//    let step_length = 0.4 * dx;
+    let step_length = 2 * settings.step_length;
+
     let uv = get_starting_point_uv(id);
 //    let uv = vec2f(f32(id.x), f32(id.y)) * texel_size_uv;
 
@@ -228,10 +231,13 @@ fn trajectory_overlay(id: vec3<u32>) {
     var acceleration_friction = vec3f(0, 0, 0);
     var dt = sqrt(2 * dx / length(acceleration_tangential));
     var last_direction = vec2f(0, 0);
+    var relative_trajectory = vec2f(0, 0);
 
     var z_delta = 0f;
+    var z_alpha = 0f;
     
     var velocity_magnitude = 0f;
+    let drag_factor = 2 * density * g * g / settings.model2_drag_coeff;
 
     for (var i: u32 = 0; i < settings.num_steps; i++) {
         // compute uv coordinates for current position
@@ -249,7 +255,7 @@ fn trajectory_overlay(id: vec3<u32>) {
         // avaframe examples have non rectangular terrain
         // missing values are noramlly -9999
         // webigeo sets them to 0
-        if (current_height < 10) {
+        if (current_height < 1) {
             break;
         }
 
@@ -263,7 +269,8 @@ fn trajectory_overlay(id: vec3<u32>) {
             //  - distance we have already
 
             let height_difference = start_point_height - current_height;
-            let z_alpha = tan(settings.runout_flowpy_alpha) * world_space_travel_distance;
+//            z_alpha += 0.466 * step_length + 0*1/300 /step_length * z_delta ;
+            z_alpha = tan(settings.runout_flowpy_alpha) * world_space_travel_distance;
             let z_gamma = height_difference;
             z_delta = z_gamma - z_alpha;
             let gamma = atan(height_difference / world_space_travel_distance); // will always be positive -> [ 0 , PI/2 ]
@@ -302,7 +309,7 @@ fn trajectory_overlay(id: vec3<u32>) {
             last_direction = normalized_current_direction;
 
             //TODO 2 is step length here, use uniform, put into ui
-            let relative_trajectory = normalized_current_direction.xy * 2 * settings.step_length;
+            relative_trajectory = normalized_current_direction.xy * step_length;
 
             world_space_offset = world_space_offset + relative_trajectory;
             world_space_travel_distance += length(relative_trajectory);
@@ -317,7 +324,7 @@ fn trajectory_overlay(id: vec3<u32>) {
             if(length(velocity) < acceleration_friction_magnitude * dt){
                 dt = length(velocity) / acceleration_friction_magnitude;
 //                let relative_trajectory = dt * 0.5 * (last_velocity + velocity);
-                let relative_trajectory = velocity * dt;
+                relative_trajectory = velocity.xy * dt;
                 world_space_offset = world_space_offset + relative_trajectory.xy;
                 world_space_travel_distance += length(relative_trajectory.xy);
                 break;
@@ -331,7 +338,7 @@ fn trajectory_overlay(id: vec3<u32>) {
 //            velocity = velocity / (1.0 - acceleration_friction /
 //                select(velocity_magnitude, velocity_threshold, velocity_magnitude < velocity_threshold) * dt);
 //            let relative_trajectory = dt * 0.5 * (last_velocity + velocity);
-            let relative_trajectory = velocity * dt;
+            relative_trajectory = velocity.xy * dt;
             world_space_offset = world_space_offset + relative_trajectory.xy;
             world_space_travel_distance += length(relative_trajectory.xy);
             velocity_magnitude = length(velocity);
@@ -339,6 +346,27 @@ fn trajectory_overlay(id: vec3<u32>) {
                 break;
             }
             last_velocity = velocity;
+        }else if (settings.model_type == 2) {
+ //            let perturbed_normal: vec3f = perturb(normal);
+ //            let perturbed_normal_2d: vec2f = normal.xy;
+             var velocity_magnitude = sqrt(z_delta*2*g);
+             if (velocity_magnitude < 1) { //check potential 0-division before normalization
+               velocity_magnitude = 1;
+             }
+             let current_direction = perturb2d(last_direction * settings.persistence_contribution + normal.xy / velocity_magnitude  * (1.0 - settings.persistence_contribution));
+
+             let dir_magnitude = length(current_direction);
+             if (dir_magnitude < 1e-25) { //check potential 0-division before normalization
+               break;
+             }
+ //            let normalized_current_direction = current_direction / dir_magnitude;
+
+             //TODO 2 is step length here, use uniform, put into ui
+             relative_trajectory = current_direction / dir_magnitude * 2;
+
+             world_space_offset = world_space_offset + relative_trajectory;
+             world_space_travel_distance += length(relative_trajectory);
+             last_direction = current_direction;
         }
     }
 }
@@ -368,6 +396,28 @@ fn perturb(v: vec3<f32>) -> vec3<f32> {
         v * cos_theta +
         tangent * sin_theta * cos(phi) +
         bitangent * sin_theta * sin(phi);
+}
+
+fn perturb2d(v: vec2<f32>) -> vec2<f32> {
+    let max_angle_rad = settings.max_perturbation * PI / 180.0; // degrees to radians
+
+    // Sample one random value for cosine-weighted distribution
+    let r = rand(); // uniform [0, 1)
+    let cos_theta = mix(cos(max_angle_rad), 1.0, r);
+    let angle = acos(cos_theta);
+
+    // Randomly choose direction (CW or CCW)
+    let sign = select(-1.0, 1.0, rand() < 0.5);
+    let theta = angle * sign;
+
+    // Rotate the input vector
+    let c = cos(theta);
+    let s = sin(theta);
+
+    return vec2<f32>(
+        c * v.x - s * v.y,
+        s * v.x + c * v.y
+    );
 }
 
 fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velocity: vec3f) -> f32 {
