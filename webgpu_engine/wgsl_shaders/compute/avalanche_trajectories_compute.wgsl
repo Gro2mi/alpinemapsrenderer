@@ -25,13 +25,25 @@
 #include "util/random.wgsl"
 #include "util/encoder.wgsl"
 
-
+struct TimestepData {
+    velocity: vec3f,                        // 12 bytes     12
+    dt: f32,                          //  4 bytes     16
+    acceleration_tangential: vec3f,         // 12 bytes     28
+    acceleration_friction_magnitude: f32,   //  4 bytes     32
+    position: vec3f,                        // 12 bytes     44
+    elevation: f32,                         //  4 bytes     48
+    normal: vec3f,                          // 12 bytes     60
+    acceleration_normal: vec3f,             // 12 bytes     76
+    // padding                                  4 bytes     80
+    uv: vec2f,                              //  8 bytes     88
+                                    // padding  8 bytes     96
+};
 // weights need to match the texels that are chosen by textureGather - this does NOT align perfectly, and introduces some artifacts
 // adding offset fixes this issue, see https://www.reedbeta.com/blog/texture-gathers-and-coordinate-precision/
 const TEXTURE_GATHER_OFFSET = 1.0f / 512.0f;
 const g: f32 = 9.81;
 const density: f32 = 200.0;
-const slab_thickness: f32 = 1;
+const slab_thickness: f32 = 1.0;
 const cfl: f32 = 0.5;
 
 const mass_per_area = density * slab_thickness;
@@ -131,7 +143,7 @@ fn draw_line_uv(start_uv: vec2f, end_uv: vec2f, value: f32, z_delta: f32, travel
 }
 
 // implementation of bresenham's line algorithm
-// adapted from https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm#All_cases (used last one, with error) 
+// adapted from https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm#All_cases (used last one, with error)
 fn draw_line_pos(start_pos: vec2u, end_pos: vec2u, value: f32, z_delta: f32, travel_length: f32, travel_angle: f32, altitude_difference: f32) {
     let dx = abs(i32(end_pos.x) - i32(start_pos.x));
     let sx = select(-1, 1, start_pos.x < end_pos.x);
@@ -197,184 +209,207 @@ fn get_starting_point_uv(id: vec3<u32>) -> vec2f {
 fn trajectory_overlay(id: vec3<u32>) {
     seed(vec4u(id, settings.random_seed)); //seed PRNG with thread id
     let pixel_size = vec2f(settings.region_size) / vec2f(textureDimensions(input_normal_texture));
-    let dx = min(pixel_size.x, pixel_size.y);
+    let dxy_min = min(pixel_size.x, pixel_size.y);
+    let elevation_threshold = min_elevation();
 
-//    let step_length = 0.4 * dx;
-    let step_length = 2 * settings.step_length;
+    let start_uv = get_starting_point_uv(id);
 
-    let uv = get_starting_point_uv(id);
-//    let uv = vec2f(f32(id.x), f32(id.y)) * texel_size_uv;
-
-    if (!sample_release_point_texture(uv)) {
+    if (!sample_release_point_texture(start_uv)) {
         return;
     }
 
     // get slope angle at start
-    let start_normal = sample_normal_texture(uv);
-    var velocity = vec3f(0, 0, 0);
-    var last_velocity = vec3f(0, 0, 0);
+    let start_normal = sample_normal_texture(start_uv);
 
     let start_slope_angle = get_slope_angle(start_normal);
     let trajectory_value = start_slope_angle / (PI / 2);
 
     // alpha-beta model state
-    let start_point_height: f32 = sample_height_texture(uv);
+    let start_point_height: f32 = sample_height_texture(start_uv);
     var world_space_travel_distance: f32 = 0.0;
-
-    var last_dir_index: i32 = -1;  // used for d8 with weights
+    var uv = start_uv; // current uv coordinates
     var last_uv = uv;
     var world_space_offset = vec2f(0, 0); // offset from original world position
+    var z_delta = 0.0;
+    var last_direction = vec2f(0, 0); // direction of last step
 
-    var normal_t = vec3f(0, 0, 1);
+    if (settings.model_type == 0) {
+        for (var i: u32 = 0; i < settings.num_steps; i++) {
+            // compute uv coordinates for current position
+            let current_uv = uv + vec2f(world_space_offset.x, -world_space_offset.y) / settings.region_size;
 
-    var acceleration_tangential =  acceleration_gravity - g * start_normal.z * start_normal;
-    var acceleration_friction = vec3f(0, 0, 0);
-    var dt = sqrt(2 * dx / length(acceleration_tangential));
-    var last_direction = vec2f(0, 0);
-    var relative_trajectory = vec2f(0, 0);
-
-    var z_delta = 0f;
-    var z_alpha = 0f;
-    
-    var velocity_magnitude = 0f;
-    let drag_factor = 2 * density * g * g / settings.model2_drag_coeff;
-
-    for (var i: u32 = 0; i < settings.num_steps; i++) {
-        // compute uv coordinates for current position
-        let current_uv = uv + vec2f(world_space_offset.x, -world_space_offset.y) / settings.region_size;
-
-        // quit if moved out of bounds
-        if (current_uv.x < 0 || current_uv.x > 1 || current_uv.y < 0 || current_uv.y > 1) {
-            break;
-        }
+            // quit if moved out of bounds
+            if (current_uv.x < 0 || current_uv.x > 1 || current_uv.y < 0 || current_uv.y > 1) {
+                break;
+            }
 
 
-        let current_height = sample_height_texture(current_uv);
+            let current_height = sample_height_texture(current_uv);
 
-        // check if we are still on the terrain
-        // avaframe examples have non rectangular terrain
-        // missing values are noramlly -9999
-        // webigeo sets them to 0
-        if (current_height < 1) {
-            break;
-        }
+            // check if we are still on the terrain
+            // avaframe examples have non rectangular terrain
+            // missing values are noramlly -9999
+            // webigeo sets them to 0
+            if (current_height < elevation_threshold) {
+                break;
+            }
 
-        let normal = sample_normal_texture(current_uv);
+            let normal = sample_normal_texture(current_uv);
 
-        if (i > 0) {
-            // calculate physical quantities
-            //  - altitude difference from starting point
-            //  - z_delta (kinetic energy ~ velocity)
-            //  - delta (local runout angle)
-            //  - distance we have already
+            if (i > 0) {
+                // calculate physical quantities
+                //  - altitude difference from starting point
+                //  - z_delta (kinetic energy ~ velocity)
+                //  - delta (local runout angle)
+                //  - distance we have already
 
-            let height_difference = start_point_height - current_height;
-//            z_alpha += 0.466 * step_length + 0*1/300 /step_length * z_delta ;
-            z_alpha = tan(settings.runout_flowpy_alpha) * world_space_travel_distance;
-            let z_gamma = height_difference;
-            z_delta = z_gamma - z_alpha;
-            let gamma = atan(height_difference / world_space_travel_distance); // will always be positive -> [ 0 , PI/2 ]
-//            let delta = gamma - settings.runout_flowpy_alpha;
-            // evaluate runout model, terminate, if necessary
-            if (settings.model_type == 0) {
-                // more info: https://docs.avaframe.org/en/latest/theoryCom4FlowPy.html
-                if (z_delta <= 0) {
+                let height_difference = start_point_height - current_height;
+                let z_alpha = tan(settings.runout_flowpy_alpha) * world_space_travel_distance;
+                let z_gamma = height_difference;
+                z_delta = z_gamma - z_alpha;
+                let gamma = atan(height_difference / world_space_travel_distance); // will always be positive -> [ 0 , PI/2 ]
+    //            let delta = gamma - settings.runout_flowpy_alpha;
+                // evaluate runout model, terminate, if necessary
+
+                    // more info: https://docs.avaframe.org/en/latest/theoryCom4FlowPy.html
+                    if (z_delta <= 0) {
+                        break;
+                    }
+
+
+                // draw line from last to current position
+                draw_line_uv(last_uv, current_uv, trajectory_value, z_delta, world_space_travel_distance, gamma, height_difference);
+            }
+            last_uv = current_uv;
+
+            // sample normal and get new world space offset based on chosen model
+                let perturbed_normal: vec3f = perturb(normal);
+                let perturbed_normal_2d: vec2f = perturbed_normal.xy;
+                var velocity_magnitude = sqrt(z_delta*2*g);
+                if (velocity_magnitude < 1) { //check potential 0-division before normalization
+                    velocity_magnitude = 1;
+                }
+                let current_direction = last_direction * settings.persistence_contribution + perturbed_normal_2d / velocity_magnitude  * (1.0 - settings.persistence_contribution);
+
+                let dir_magnitude = length(current_direction);
+                if (dir_magnitude < 0.001) { //check potential 0-division before normalization
                     break;
                 }
+                let normalized_current_direction = current_direction / dir_magnitude;
+                last_direction = normalized_current_direction;
+
+                //TODO 2 is step length here, use uniform, put into ui
+                let relative_trajectory = normalized_current_direction.xy * 2 * settings.step_length;
+
+                world_space_offset = world_space_offset + relative_trajectory;
+                world_space_travel_distance += length(relative_trajectory);
             }
-            if (settings.model_type == 1) {
-                z_delta = velocity_magnitude * velocity_magnitude / (2*g);
-            }
-
-            // draw line from last to current position
-            draw_line_uv(last_uv, current_uv, trajectory_value, z_delta, world_space_travel_distance, gamma, height_difference);
-        }
-        last_uv = current_uv;
-
-        // sample normal and get new world space offset based on chosen model
-        if (settings.model_type == 0) {
-            let perturbed_normal: vec3f = perturb(normal);
-            let perturbed_normal_2d: vec2f = perturbed_normal.xy;
-            var velocity_magnitude = sqrt(z_delta*2*g);
-            if (velocity_magnitude < 1) { //check potential 0-division before normalization
-                velocity_magnitude = 1;
-            }
-            let current_direction = last_direction * settings.persistence_contribution + perturbed_normal_2d / velocity_magnitude  * (1.0 - settings.persistence_contribution);
-
-            let dir_magnitude = length(current_direction);
-            if (dir_magnitude < 0.001) { //check potential 0-division before normalization
-                break;
-            }
-            let normalized_current_direction = current_direction / dir_magnitude;
-            last_direction = normalized_current_direction;
-
-            //TODO 2 is step length here, use uniform, put into ui
-            relative_trajectory = normalized_current_direction.xy * step_length;
-
-            world_space_offset = world_space_offset + relative_trajectory;
-            world_space_travel_distance += length(relative_trajectory);
         } else if (settings.model_type == 1) {
-            let acceleration_normal = g * normal.z * normal;
-            let acceleration_tangential = acceleration_gravity + acceleration_normal;
-            // estimate optimal timestep
-            dt = cfl * dx / length(velocity + acceleration_tangential * dt);
-            let acceleration_friction_magnitude = acceleration_by_friction(acceleration_normal, mass_per_area, velocity);
-            velocity = velocity + acceleration_tangential * dt;
-            // friction stop criterion, it has to use the new timestep
-            if(length(velocity) < acceleration_friction_magnitude * dt){
-                dt = length(velocity) / acceleration_friction_magnitude;
-//                let relative_trajectory = dt * 0.5 * (last_velocity + velocity);
-                relative_trajectory = velocity.xy * dt;
-                world_space_offset = world_space_offset + relative_trajectory.xy;
-                world_space_travel_distance += length(relative_trajectory.xy);
-                break;
-            }
-            last_velocity = velocity;
-            velocity = velocity + acceleration_tangential * dt;
-            // explicit
-            velocity = velocity - acceleration_friction_magnitude * normalize(velocity) * dt;
-            // implicit
-//            velocity_magnitude = length(velocity);
-//            velocity = velocity / (1.0 - acceleration_friction /
-//                select(velocity_magnitude, velocity_threshold, velocity_magnitude < velocity_threshold) * dt);
-//            let relative_trajectory = dt * 0.5 * (last_velocity + velocity);
-            relative_trajectory = velocity.xy * dt;
-            world_space_offset = world_space_offset + relative_trajectory.xy;
-            world_space_travel_distance += length(relative_trajectory.xy);
-            velocity_magnitude = length(velocity);
-            if (velocity_magnitude < velocity_threshold ){
-                break;
-            }
-            last_velocity = velocity;
-        }else if (settings.model_type == 2) {
- //            let perturbed_normal: vec3f = perturb(normal);
- //            let perturbed_normal_2d: vec2f = normal.xy;
-             var velocity_magnitude = sqrt(z_delta*2*g);
-             if (velocity_magnitude < 1) { //check potential 0-division before normalization
-               velocity_magnitude = 1;
-             }
-             let current_direction = perturb2d(last_direction * settings.persistence_contribution + normal.xy / velocity_magnitude  * (1.0 - settings.persistence_contribution));
 
-             let dir_magnitude = length(current_direction);
-             if (dir_magnitude < 1e-25) { //check potential 0-division before normalization
-               break;
-             }
- //            let normalized_current_direction = current_direction / dir_magnitude;
+    let elevation_threshold = min_elevation() - 0.1;
+    var last: TimestepData;
+    last.uv = start_uv;
 
-             //TODO 2 is step length here, use uniform, put into ui
-             relative_trajectory = current_direction / dir_magnitude * 2;
+    // webigeo copy part,
+    // uncomment steps_count.value
+    last.elevation = get_elevation(last.uv);
+    last.normal = get_normal(last.uv);
+    // last.position = vec3f(input_point.x, input_point.y, last.elevation);
+    // this is not possible in webigeo
+    last.position = vec3f(0f, 0f, last.elevation);
+    last.velocity = vec3f(0f, 0f, 0f);
+    last.acceleration_tangential = acceleration_gravity + g * last.normal.z * last.normal;
+    last.acceleration_friction_magnitude = 0f;
+    // estimation of the first timestep to calculate actual timestep, safety factor of 1.1 needs to be
+    // bigger than 1.0 because it's in the divisor later
+    last.dt = sqrt(cfl * dxy_min / length(last.acceleration_tangential)) * 1.1;
+    // update_output_data(0u, last);
 
-             world_space_offset = world_space_offset + relative_trajectory;
-             world_space_travel_distance += length(relative_trajectory);
-             last_direction = current_direction;
+    for (var i: u32 = 0u; i < settings.num_steps; i++) {
+        let current: TimestepData = compute_timestep(last, dxy_min);
+        // update_output_data(i + 1u, current);
+        world_space_travel_distance += length(current.velocity) * current.dt;
+        let height_difference = start_point_height - current.elevation;
+
+        let gamma = atan(height_difference / world_space_travel_distance);
+        draw_line_uv(last.uv, current.uv, trajectory_value, length(current.velocity), world_space_travel_distance, gamma, height_difference);
+
+        // TODO more sophisticated projection methods
+        last = current;
+        last.position.z = last.elevation;
+
+        // stop criterion friction
+        if (length(current.velocity) < 0.0001) {
+            // sim_info.step_count = i + 2u;
+            break;
         }
+        // out of bounds or non rectangular terrain
+        if(current.uv.x < 0.0 || current.uv.x > 1.0 || current.uv.y < 0.0 || current.uv.y > 1.0
+            || last.elevation < elevation_threshold){
+            // sim_info.step_count = i;
+            break;
+        }
+
     }
 }
 
+}
 
+
+fn compute_timestep(last: TimestepData, dxy_min: f32) -> TimestepData {
+        var current: TimestepData;
+        current.normal = get_normal(last.uv);
+        current.acceleration_normal = g * current.normal.z * current.normal;
+        current.acceleration_tangential = acceleration_gravity + current.acceleration_normal;
+        // avoid division by zero with velocity_threshold
+        current.dt = cfl * dxy_min / (length(last.velocity + current.acceleration_tangential * last.dt) + velocity_threshold);
+
+        current.dt = min(current.dt, 0.8);
+        current.acceleration_friction_magnitude = acceleration_by_friction(current.acceleration_normal, mass_per_area, last.velocity);
+        current.velocity = last.velocity + current.acceleration_tangential * current.dt;
+        // friction stop condition
+        if(length(current.velocity) < current.acceleration_friction_magnitude * current.dt){
+            current.dt = length(current.velocity) / current.acceleration_friction_magnitude;
+        }
+        current.velocity = current.velocity - current.acceleration_friction_magnitude * normalize(current.velocity) * current.dt;
+        current.velocity = perturb(current.velocity);
+        let relative_trajectory = current.velocity * current.dt;
+        current.position = last.position + relative_trajectory;
+        // current.uv = world_to_uv(vec2f(current.position.x, current.position.y));
+        current.uv = last.uv + vec2f(relative_trajectory.x, -relative_trajectory.y) / settings.region_size;
+        current.elevation = get_elevation(current.uv);
+        return current;
+}
+
+// helpers for easier copying from dev environment
+fn get_elevation(uv: vec2f) -> f32 {
+    // get elevation at uv coordinates
+    return sample_height_texture(uv);
+}
+fn get_normal(uv: vec2f) -> vec3f {
+    // get normal at uv coordinates
+    return sample_normal_texture(uv);
+}
+
+fn min_elevation() -> f32 {
+    // find the minimum elevation in the height texture
+    let tex_size = textureDimensions(input_height_texture);
+    var min_val: f32 = 1e10;
+
+    for (var y: u32 = 0; y < tex_size.y; y++) {
+        for (var x: u32 = 0; x < tex_size.x; x++) {
+            let value = textureLoad(input_height_texture, vec2u(x, y), 0).x;
+            if (value < min_val && value > 0.9) { // ignore invalid values
+                min_val = value;
+            }
+        }
+    }
+    return min_val;
+}
 // Generates a random unit vector in a cone around the given vector
 fn perturb(v: vec3<f32>) -> vec3<f32> {
-    let cos_max_angle_rad = cos(settings.max_perturbation * PI / 180.0); // max angle in radians
+    // let cos_max_angle_rad = cos(settings.max_perturbation * PI / 180.0); // max angle in radians
+    let cos_max_angle_rad = cos(45 * PI / 180.0); // max angle in radians
     let r = rand2();
     let u1 = r.x;
     let u2 = r.y;
@@ -398,28 +433,6 @@ fn perturb(v: vec3<f32>) -> vec3<f32> {
         bitangent * sin_theta * sin(phi);
 }
 
-fn perturb2d(v: vec2<f32>) -> vec2<f32> {
-    let max_angle_rad = settings.max_perturbation * PI / 180.0; // degrees to radians
-
-    // Sample one random value for cosine-weighted distribution
-    let r = rand(); // uniform [0, 1)
-    let cos_theta = mix(cos(max_angle_rad), 1.0, r);
-    let angle = acos(cos_theta);
-
-    // Randomly choose direction (CW or CCW)
-    let sign = select(-1.0, 1.0, rand() < 0.5);
-    let theta = angle * sign;
-
-    // Rotate the input vector
-    let c = cos(theta);
-    let s = sin(theta);
-
-    return vec2<f32>(
-        c * v.x - s * v.y,
-        s * v.x + c * v.y
-    );
-}
-
 fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velocity: vec3f) -> f32 {
     let velocity_magnitude = length(velocity);
     if (velocity_magnitude < velocity_threshold || settings.runout_model_type == 4) {
@@ -427,7 +440,7 @@ fn acceleration_by_friction(acceleration_normal: vec3f, mass_per_area: f32, velo
     }
     let model = settings.runout_model_type;
     // standard 0.155, samos: standard 0.155, small 0.22, medium 0.17
-    let friction_coefficient = settings.model2_friction_coeff;
+    let friction_coefficient = 0.4663;
     let drag_coefficient = settings.model2_drag_coeff; // only used for voellmy, standard 4000.
     let normal_stress = length(acceleration_normal * mass_per_area);
     const min_shear_stress = 70f;
