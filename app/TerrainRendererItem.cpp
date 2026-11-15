@@ -34,6 +34,7 @@
 #include <QQuickWindow>
 #include <QThread>
 #include <QTimer>
+#include <gl_engine/Context.h>
 #include <gl_engine/Window.h>
 #include <glm/glm.hpp>
 #include <glm/gtx/string_cast.hpp>
@@ -45,6 +46,7 @@
 #include <nucleus/map_label/Filter.h>
 #include <nucleus/map_label/Scheduler.h>
 #include <nucleus/picker/PickerManager.h>
+#include <nucleus/planner/PlannerManager.h>
 #include <nucleus/srs.h>
 #include <nucleus/tile/GeometryScheduler.h>
 #include <nucleus/tile/TextureScheduler.h>
@@ -123,17 +125,57 @@ QQuickFramebufferObject::Renderer* TerrainRendererItem::createRenderer() const
     connect(this, &TerrainRendererItem::touch_made, r->controller(), &nucleus::camera::Controller::touch);
     connect(this, &TerrainRendererItem::mouse_pressed, r->controller(), &nucleus::camera::Controller::mouse_press);
     connect(this, &TerrainRendererItem::mouse_moved, r->controller(), &nucleus::camera::Controller::mouse_move);
+    connect(this, &TerrainRendererItem::mouse_released, r->controller(), &nucleus::camera::Controller::mouse_release);
     connect(this, &TerrainRendererItem::wheel_turned, r->controller(), &nucleus::camera::Controller::wheel_turn);
     connect(this, &TerrainRendererItem::key_pressed, r->controller(), &nucleus::camera::Controller::key_press);
     connect(this, &TerrainRendererItem::key_released, r->controller(), &nucleus::camera::Controller::key_release);
     connect(this, &TerrainRendererItem::update_camera_requested, r->controller(), &nucleus::camera::Controller::advance_camera);
     connect(this, &TerrainRendererItem::position_set_by_user, r->controller(), &nucleus::camera::Controller::fly_to_latitude_longitude);
+    connect(this, &TerrainRendererItem::position_move_requested, r->controller(), &nucleus::camera::Controller::move_to_latitude_longitude);
     connect(this, &TerrainRendererItem::rotation_north_requested, r->controller(), &nucleus::camera::Controller::rotate_north);
 
     connect(this, &TerrainRendererItem::touch_made, ctx->picker_manager().get(), &nucleus::picker::PickerManager::touch_event);
     connect(this, &TerrainRendererItem::mouse_pressed, ctx->picker_manager().get(), &nucleus::picker::PickerManager::mouse_press_event);
     connect(this, &TerrainRendererItem::mouse_released, ctx->picker_manager().get(), &nucleus::picker::PickerManager::mouse_release_event);
     connect(this, &TerrainRendererItem::mouse_moved, ctx->picker_manager().get(), &nucleus::picker::PickerManager::mouse_move_event);
+
+    // gpx editor: detect clicks on the terrain and resolve them into geo coordinates
+    connect(this, &TerrainRendererItem::touch_made, ctx->planner_manager().get(), &nucleus::planner::PlannerManager::touch_event);
+    connect(this, &TerrainRendererItem::mouse_pressed, ctx->planner_manager().get(), &nucleus::planner::PlannerManager::mouse_press_event);
+    connect(this, &TerrainRendererItem::mouse_released, ctx->planner_manager().get(), &nucleus::planner::PlannerManager::mouse_release_event);
+    connect(this, &TerrainRendererItem::mouse_moved, ctx->planner_manager().get(), &nucleus::planner::PlannerManager::mouse_move_event);
+    connect(this, &TerrainRendererItem::edit_mode_changed, ctx->planner_manager().get(), &nucleus::planner::PlannerManager::set_edit_mode);
+    connect(ctx->planner_manager().get(), &nucleus::planner::PlannerManager::click_detected, r->controller(), &nucleus::camera::Controller::query_world_position);
+    connect(r->controller(), &nucleus::camera::Controller::world_position_queried, this,
+            [this](const glm::dvec3& lat_long_alt) {
+                emit planner_point_picked(lat_long_alt.x, lat_long_alt.y, lat_long_alt.z);
+            });
+    connect(this, &TerrainRendererItem::keyboard_focus_lost, r->controller(), &nucleus::camera::Controller::clear_keyboard_state);
+    connect(this, &TerrainRendererItem::route_preview_started, r->controller(), &nucleus::camera::Controller::start_route_preview);
+    connect(this, &TerrainRendererItem::route_preview_stopped, r->controller(), &nucleus::camera::Controller::stop_route_preview);
+    connect(this, &TerrainRendererItem::route_preview_pause_changed, r->controller(), &nucleus::camera::Controller::set_route_preview_paused);
+    connect(this, &TerrainRendererItem::route_preview_seek_requested, r->controller(), &nucleus::camera::Controller::seek_route_preview);
+    connect(this, &TerrainRendererItem::route_preview_speed_changed, r->controller(), &nucleus::camera::Controller::set_route_preview_speed);
+    // during the camera fly-through no route is rendered
+    // (receiver = track manager lives on the render thread -> queued)
+    if (const auto engine_context = ctx->engine_context()) {
+        if (auto* track_manager = engine_context->track_manager()) {
+            connect(this, &TerrainRendererItem::route_preview_started, track_manager, [track_manager]() {
+                track_manager->set_flight_mode(true);
+            });
+            connect(this, &TerrainRendererItem::route_preview_stopped, track_manager, [track_manager]() {
+                track_manager->set_flight_mode(false);
+            });
+        }
+    }
+    connect(r->controller(), &nucleus::camera::Controller::route_preview_changed, this,
+            [item = const_cast<TerrainRendererItem*>(this)](double fraction, bool paused, bool active, double speed) {
+                item->m_preview_progress = fraction;
+                item->m_preview_paused = paused;
+                item->m_preview_active = active;
+                item->m_preview_speed = speed;
+                emit item->preview_state_changed();
+            });
 
     // Connect definition change to aquire camera position for sun angle calculation
     connect(r->controller(), &nucleus::camera::Controller::definition_changed, this, &TerrainRendererItem::camera_definition_changed);
@@ -219,6 +261,15 @@ void TerrainRendererItem::keyReleaseEvent(QKeyEvent* e)
     RenderThreadNotifier::instance()->notify();
 }
 
+void TerrainRendererItem::focusOutEvent(QFocusEvent* event)
+{
+    QQuickItem::focusOutEvent(event);
+    // keys pressed before losing focus never see their release event (e.g.
+    // alt+tab), which leaves the camera interaction styles with stuck modifier
+    // state (zooming instead of panning)
+    emit keyboard_focus_lost();
+}
+
 void TerrainRendererItem::camera_definition_changed(const nucleus::camera::Definition& new_definition)
 {
     auto camPositionWS = new_definition.position();
@@ -239,6 +290,12 @@ void TerrainRendererItem::camera_definition_changed(const nucleus::camera::Defin
 void TerrainRendererItem::set_position(double latitude, double longitude)
 {
     emit position_set_by_user(latitude, longitude);
+    RenderThreadNotifier::instance()->notify();
+}
+
+void TerrainRendererItem::move_position(double latitude, double longitude)
+{
+    emit position_move_requested(latitude, longitude);
     RenderThreadNotifier::instance()->notify();
 }
 
@@ -457,6 +514,53 @@ void TerrainRendererItem::set_world_space_cursor_position(const glm::dvec3& new_
         return;
     m_world_space_cursor_position = new_vec3d;
     emit world_space_cursor_position_changed(m_world_space_cursor_position);
+}
+
+void TerrainRendererItem::change_edit_mode(bool edit_mode)
+{
+    emit edit_mode_changed(edit_mode);
+}
+
+void TerrainRendererItem::start_route_preview()
+{
+    const auto points = RenderingContext::instance()->preview_route_points();
+    if (points.size() < 2) {
+        return;
+    }
+    // keep the frame loop running while the preview flies
+    m_continuous_update_before_preview = m_continuous_update;
+    set_continuous_update(true);
+    emit route_preview_started(points);
+}
+
+void TerrainRendererItem::stop_route_preview()
+{
+    if (!m_preview_active) {
+        return;
+    }
+    emit route_preview_stopped();
+    set_continuous_update(m_continuous_update_before_preview);
+    m_preview_active = false;
+    m_preview_paused = false;
+    m_preview_progress = 0.0;
+    emit preview_state_changed();
+}
+
+void TerrainRendererItem::set_preview_paused(bool paused)
+{
+    emit route_preview_pause_changed(paused);
+}
+
+void TerrainRendererItem::seek_preview(double fraction)
+{
+    emit route_preview_seek_requested(fraction);
+}
+
+void TerrainRendererItem::set_preview_speed(double metres_per_second)
+{
+    m_preview_speed = metres_per_second;
+    emit route_preview_speed_changed(metres_per_second);
+    emit preview_state_changed();
 }
 
 const nucleus::picker::Feature& TerrainRendererItem::picked_feature() const { return m_picked_feature; }

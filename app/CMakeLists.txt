@@ -29,6 +29,8 @@ qt_add_executable(alpineapp
     TerrainRendererItem.h TerrainRendererItem.cpp
     GnssInformation.h GnssInformation.cpp
     TrackModel.h TrackModel.cpp
+    PlannerModel.h PlannerModel.cpp
+    ElevationProfile.h ElevationProfile.cpp
     ModelBinding.h ModelBinding.cpp
     RenderingContext.h RenderingContext.cpp
 )
@@ -42,6 +44,7 @@ qt_add_qml_module(alpineapp
         icons/mascot.jpg
         icons/menu.png
         icons/search.png
+        icons/steepness_legend.png
         icons/icon.png
         icons/eaws/eaws_menu.png
         icons/eaws/eaws_report.png
@@ -60,9 +63,11 @@ qt_add_qml_module(alpineapp
         icons/material/navigation.png
         icons/material/navigation_offset.png
         icons/material/add.png
+        icons/material/track.png
         icons/material/chevron_left.png
         icons/material/visibility_off.png
         icons/material/filter_alt.png
+        icons/material/steepness.png
         icons/presets/basic.png
         icons/presets/shaded.png
         icons/presets/snow.png
@@ -82,6 +87,7 @@ qt_add_qml_module(alpineapp
         SearchResults.qml
         Settings.qml
         Coordinates.qml
+        GpxEditor.qml
         GeneralSettings.qml
         GlSettings.qml
         FloatingActionButtonGroup.qml
@@ -139,6 +145,10 @@ set_target_properties(alpineapp PROPERTIES
     QT_ANDROID_VERSION_CODE "${ALP_VERSION_INTEGER}"
 )
 target_link_libraries(alpineapp PUBLIC gl_engine Qt::Quick Qt::QuickControls2)
+if (NOT EMSCRIPTEN)
+    # the lite WebAssembly Qt is built without the future feature, so it has no Qt Concurrent
+    target_link_libraries(alpineapp PUBLIC Qt::Concurrent)
+endif()
 alp_configure_target(alpineapp)
 
 if (ALP_ENABLE_QML_HOT_RELOAD)
