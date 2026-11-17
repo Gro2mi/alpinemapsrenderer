@@ -93,6 +93,7 @@ qt_add_qml_module(alpineapp
         FloatingActionButtonGroup.qml
         FilterWindow.qml
         PickerWindow.qml
+        components/DirectionButton.qml
         components/LabledSlider.qml
         components/LabledRangeSlider.qml
         components/ColorPicker.qml
@@ -209,6 +210,9 @@ if (ANDROID)
 endif()
 
 if (EMSCRIPTEN)
+    # route persistence: the saved routes live in an idbfs mount (IndexedDB),
+    # see PlannerModel::routes_directory
+    target_link_options(alpineapp PRIVATE -lidbfs.js)
     install(
         FILES
             "$<TARGET_FILE_DIR:alpineapp>/alpineapp.js"

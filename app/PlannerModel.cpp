@@ -36,6 +36,96 @@
 #include <nucleus/tile/GeometryScheduler.h>
 #include <nucleus/tile/cache_quieries.h>
 #include <nucleus/srs.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
+#ifdef __EMSCRIPTEN__
+// webassembly: the routes directory lives in the idbfs mount (persisted to
+// IndexedDB), but qt never flushes it on its own - every write is followed
+// by a syncfs(false) and the routes saved by a previous session are pulled
+// back with a syncfs(true) at startup, whose callback refreshes the list
+
+static PlannerModel* alpine_app_wasm_planner = nullptr;
+
+EM_JS(void, alpine_app_routes_fs_sync_to_idb, (), {
+    FS.syncfs(false, function(err) {
+        if (err)
+            console.error('Failed to persist routes', err);
+    });
+});
+
+// the idbfs mount uses EM_ASM (not EM_JS): emscripten scans EM_ASM bodies
+// for js library symbols, so IDBFS from -lidbfs.js is resolved here; an
+// EM_JS body would leave it undefined at runtime
+static void alpine_app_routes_fs_init()
+{
+    EM_ASM({
+        // nothing is persisted unless an idbfs filesystem exists: mount it,
+        // create the routes directory inside it and pull what a previous
+        // session saved out of IndexedDB
+        try {
+            FS.mkdir('/idbfs'); // the mount point must exist before mounting
+        } catch (e) {} // already exists
+        try {
+            FS.mount(IDBFS, {}, '/idbfs');
+        } catch (e) {
+            console.error('Failed to mount idbfs', e && (e.message || e.errno || e));
+            return;
+        }
+        try {
+            FS.mkdir('/idbfs/routes');
+        } catch (e) {} // already exists
+        FS.syncfs(true, function(err) {
+            if (err) {
+                console.error('Failed to load persisted routes', err);
+                return;
+            }
+            _alpine_app_routes_fs_synced();
+        });
+    });
+}
+
+EM_JS(void, alpine_app_open_gpx_picker_and_mount, (), {
+    const file_selector = document.createElement('input');
+    file_selector.type = 'file';
+    file_selector.accept = '.gpx';
+    file_selector.addEventListener('change', event => {
+        const file = event.target.files[0];
+        if (!file)
+            return;
+        const file_reader = new FileReader();
+        file_reader.addEventListener('load', load_event => {
+            try {
+                const data = new Uint8Array(load_event.target.result);
+                // fixed file name: the picked name is not needed (the route
+                // name comes from the gpx content), and sanitizing it would
+                // replace the dot of the extension with an underscore
+                const stream = FS.open('/tmp/planner_import/import.gpx', 'w+');
+                FS.write(stream, data, 0, data.length, 0);
+                FS.close(stream);
+                _alpine_app_planner_import_ready();
+            } catch (error) {
+                console.error('Failed to load GPX file', error);
+            }
+        }, { once: true });
+        file_reader.readAsArrayBuffer(file);
+    }, { once: true });
+    file_selector.click();
+});
+
+extern "C" EMSCRIPTEN_KEEPALIVE void alpine_app_routes_fs_synced()
+{
+    if (alpine_app_wasm_planner)
+        emit alpine_app_wasm_planner->saved_routes_changed();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void alpine_app_planner_import_ready()
+{
+    if (alpine_app_wasm_planner)
+        alpine_app_wasm_planner->finish_wasm_import();
+}
+#endif
 
 namespace {
 // dem cell size fallback (metres) for interpolation steps when no dem tile
@@ -74,7 +164,13 @@ constexpr int k_marker_point_limit = 50;
 // saved routes live in the app data directory, one gpx file per route
 QString routes_directory()
 {
+#ifdef __EMSCRIPTEN__
+    // the idbfs mount at /idbfs is created at startup (see the fs init js
+    // above) and persisted to IndexedDB on every save/delete
+    return QStringLiteral("/idbfs/routes");
+#else
     return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + QStringLiteral("/routes");
+#endif
 }
 } // namespace
 
@@ -105,6 +201,13 @@ PlannerModel::PlannerModel(QObject* parent)
             clear_status();
         }
     });
+
+#ifdef __EMSCRIPTEN__
+    alpine_app_wasm_planner = this;
+    // pull the routes saved by a previous session out of IndexedDB; the
+    // callback refreshes the saved-routes list when it lands
+    alpine_app_routes_fs_init();
+#endif
 }
 
 int PlannerModel::point_count() const { return int(m_plan.point_count()); }
@@ -778,6 +881,9 @@ void PlannerModel::save_route(const QString& name)
     route.creationDateTime = QDateTime::currentDateTime();
     if (route.save(dir.filePath(used_name + QStringLiteral(".gpx")))) {
         set_transient_status(tr("Route saved"));
+#ifdef __EMSCRIPTEN__
+        alpine_app_routes_fs_sync_to_idb(); // flush the idbfs mount to IndexedDB
+#endif
         emit saved_routes_changed();
         if (m_route_dirty) {
             m_route_dirty = false;
@@ -810,9 +916,48 @@ void PlannerModel::delete_route(const QString& file_name)
         return;
     }
     if (QFile::remove(routes_directory() + QLatin1Char('/') + file_name)) {
+#ifdef __EMSCRIPTEN__
+        alpine_app_routes_fs_sync_to_idb();
+#endif
         emit saved_routes_changed();
     }
 }
+
+bool PlannerModel::import_route_file()
+{
+#ifdef __EMSCRIPTEN__
+    // the qml file dialog cannot give us file contents on webassembly: the
+    // browser picker is opened instead and the file is mounted into the
+    // memory file system, then imported (like the track upload flow)
+    QDir dir("/tmp/planner_import/");
+    for (const QFileInfo& entry : dir.entryInfoList(QDir::Files)) {
+        QFile::remove(entry.absoluteFilePath()); // import only the fresh pick
+    }
+    dir.mkpath(QStringLiteral("."));
+    alpine_app_open_gpx_picker_and_mount();
+    return true;
+#else
+    return false;
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+void PlannerModel::finish_wasm_import()
+{
+    // the picker always mounts the picked file as import.gpx
+    const QDir dir("/tmp/planner_import/");
+    const QString path = dir.absoluteFilePath(QStringLiteral("import.gpx"));
+    if (!QFileInfo::exists(path)) {
+        qWarning() << "PlannerModel: imported file did not arrive";
+        return;
+    }
+    if (load_gpx_file(path, QStringLiteral("import"))) {
+        // imports are saved automatically, like on the desktop
+        save_route(m_plan.name);
+    }
+    QFile::remove(path);
+}
+#endif
 
 void PlannerModel::optimise_route()
 {

@@ -22,7 +22,6 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import QtQuick.Dialogs
-import QtCore
 
 import app
 import "components"
@@ -151,7 +150,6 @@ Rectangle {
         nameFilters: ["GPX (*.gpx)"]
         defaultSuffix: "gpx"
         fileMode: FileDialog.SaveFile
-        currentFolder: StandardPaths.standardLocations(StandardPaths.DownloadLocation)[0]
         onAccepted: _planner_model.export_gpx(export_dialog.selectedFile)
     }
 
@@ -205,9 +203,9 @@ Rectangle {
                 }
                 // mirror of the planner's back button: switches to the
                 // planner while a route is in progress
-                ToolButton {
+                DirectionButton {
                     visible: _planner_model.point_count > 0
-                    text: "›"
+                    direction: 180
                     onClicked: gpx_root.open_planner()
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Continue editing the current route")
@@ -303,7 +301,13 @@ Rectangle {
                 Button {
                     text: qsTr("Import GPX")
                     Layout.fillWidth: true
-                    onClicked: import_dialog.open()
+                    onClicked: {
+                        // on webassembly the model opens the browser file
+                        // picker instead; only the desktop falls back to the
+                        // native dialog
+                        if (!_planner_model.import_route_file())
+                            import_dialog.open()
+                    }
                 }
             }
         }
@@ -334,8 +338,7 @@ Rectangle {
                     Layout.leftMargin: 10
                     Layout.rightMargin: 10
 
-                    ToolButton {
-                        text: "‹"
+                    DirectionButton {
                         onClicked: gpx_root.show_routes = true
                         ToolTip.visible: hovered
                         ToolTip.text: qsTr("Back to saved routes")
@@ -355,8 +358,8 @@ Rectangle {
                         ToolTip.visible: hovered
                         ToolTip.text: qsTr("How to plan a route")
                     }
-                    ToolButton {
-                        text: minimized ? "▲" : "▼"
+                    DirectionButton {
+                        direction: minimized ? 90 : 270
                         onClicked: gpx_root.minimized = !gpx_root.minimized
                         ToolTip.visible: hovered
                         ToolTip.text: minimized ? qsTr("Show route planner") : qsTr("Minimize to see the map")
@@ -380,8 +383,8 @@ Rectangle {
 
                 Label {
                     text: _planner_model.point_count + " points | "
-                          + format_distance(_planner_model.distance) + " | ↑ "
-                          + _planner_model.ascent.toFixed(0) + " m | ↓ "
+                          + format_distance(_planner_model.distance) + " | "
+                          + _planner_model.ascent.toFixed(0) + " / "
                           + _planner_model.descent.toFixed(0) + " m"
                     Layout.fillWidth: true
                     Layout.leftMargin: 10
@@ -444,8 +447,8 @@ Rectangle {
                         }
                         Layout.fillWidth: true
                     }
-                    ToolButton {
-                        text: gpx_root.weights_visible ? "▼" : "▲"
+                    DirectionButton {
+                        direction: gpx_root.weights_visible ? 270 : 90
                         onClicked: gpx_root.weights_visible = !gpx_root.weights_visible
                         ToolTip.visible: hovered
                         ToolTip.text: gpx_root.weights_visible ? qsTr("Hide optimisation weights")
@@ -460,7 +463,7 @@ Rectangle {
                     stepSize: 1
                     value: _planner_model.steepness_weight
                     onMoved: _planner_model.steepness_weight = value
-                    formatCallback: function(value) { return qsTr("slope ↓ ") + value.toFixed(0) + "%"; }
+                    formatCallback: function(value) { return qsTr("slope down ") + value.toFixed(0) + "%"; }
                     Layout.fillWidth: true
                     Layout.leftMargin: 10
                     Layout.rightMargin: 10
@@ -473,7 +476,7 @@ Rectangle {
                     stepSize: 1
                     value: _planner_model.uphill_steepness_weight
                     onMoved: _planner_model.uphill_steepness_weight = value
-                    formatCallback: function(value) { return qsTr("slope ↑ ") + value.toFixed(0) + "%"; }
+                    formatCallback: function(value) { return qsTr("slope up ") + value.toFixed(0) + "%"; }
                     Layout.fillWidth: true
                     Layout.leftMargin: 10
                     Layout.rightMargin: 10
@@ -564,15 +567,15 @@ Rectangle {
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                         }
-                        ToolButton {
-                            text: "▲"
+                        DirectionButton {
+                            direction: 90
                             enabled: index > 0
                             onClicked: _planner_model.move_point_up(index)
                             ToolTip.visible: hovered
                             ToolTip.text: qsTr("Move point up")
                         }
-                        ToolButton {
-                            text: "▼"
+                        DirectionButton {
+                            direction: 270
                             enabled: index < _planner_model.point_count - 1
                             onClicked: _planner_model.move_point_down(index)
                             ToolTip.visible: hovered
@@ -680,8 +683,8 @@ Rectangle {
                 // keep the bar narrow: only the bigger of gain/loss is shown
                 text: (_planner_model.distance / 1000).toFixed(1) + " km | "
                       + (_planner_model.ascent >= _planner_model.descent
-                         ? "↑ " + _planner_model.ascent.toFixed(0)
-                         : "↓ " + _planner_model.descent.toFixed(0)) + " m"
+                         ? "+ " + _planner_model.ascent.toFixed(0)
+                         : "- " + _planner_model.descent.toFixed(0)) + " m"
                 elide: Text.ElideRight
                 Layout.fillWidth: true
             }
@@ -700,17 +703,17 @@ Rectangle {
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Optimize the route")
             }
+            DirectionButton {
+                direction: 90
+                onClicked: gpx_root.minimized = false
+                ToolTip.visible: hovered
+                ToolTip.text: qsTr("Show route planner")
+            }
             ToolButton {
                 text: "×"
                 onClicked: gpx_root.closeRequested()
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Close the route planner")
-            }
-            ToolButton {
-                text: "▲"
-                onClicked: gpx_root.minimized = false
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("Show route planner")
             }
         }
     }
