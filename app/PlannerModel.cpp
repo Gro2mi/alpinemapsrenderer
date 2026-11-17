@@ -28,6 +28,8 @@
 #endif
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
+#include <QStandardPaths>
 #include <gl_engine/Context.h>
 #include <nucleus/DataQuerier.h>
 #include <nucleus/planner/RouteOptimizer.h>
@@ -57,6 +59,23 @@ constexpr double k_user_position_z_offset = 3.0;
 // the user position dot is re-placed at this interval, so its dem altitude
 // follows the currently displayed terrain while it is active
 constexpr int k_user_position_refresh_interval_ms = 1000;
+// success status messages disappear on their own after this long
+constexpr int k_status_expiry_ms = 3000;
+// a click within this distance of a route point lands on the point (hold to
+// move it) instead of appending a new one
+constexpr double k_point_grab_radius = 20.0;
+// a click within this distance of the planned route line asks whether a
+// waypoint should be inserted at that position
+constexpr double k_waypoint_insert_radius = 25.0;
+// recorded tracks carry thousands of points; the per-point markers are only
+// useful for hand-planned routes
+constexpr int k_marker_point_limit = 50;
+
+// saved routes live in the app data directory, one gpx file per route
+QString routes_directory()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + QStringLiteral("/routes");
+}
 } // namespace
 
 PlannerModel::PlannerModel(QObject* parent)
@@ -78,7 +97,17 @@ PlannerModel::PlannerModel(QObject* parent)
 
     m_user_position_timer.setInterval(k_user_position_refresh_interval_ms);
     connect(&m_user_position_timer, &QTimer::timeout, this, &PlannerModel::place_user_position);
+
+    m_status_timer.setSingleShot(true);
+    m_status_timer.setInterval(k_status_expiry_ms);
+    connect(&m_status_timer, &QTimer::timeout, this, [this]() {
+        if (m_status == m_transient_status) {
+            clear_status();
+        }
+    });
 }
+
+int PlannerModel::point_count() const { return int(m_plan.point_count()); }
 
 QVariantList PlannerModel::points() const
 {
@@ -105,6 +134,7 @@ void PlannerModel::set_name(const QString& new_name)
         return;
     }
     m_plan.name = new_name;
+    mark_plan_dirty();
     emit name_changed();
 }
 
@@ -116,6 +146,7 @@ void PlannerModel::set_description(const QString& new_description)
         return;
     }
     m_plan.description = new_description;
+    mark_plan_dirty();
     emit description_changed();
 }
 
@@ -133,6 +164,28 @@ void PlannerModel::set_steepness_weight(int weight)
         return;
     }
     m_steepness_weight = weight;
+    emit optimisation_parameters_changed();
+}
+
+int PlannerModel::uphill_steepness_weight() const { return m_uphill_steepness_weight; }
+
+void PlannerModel::set_uphill_steepness_weight(int weight)
+{
+    if (m_uphill_steepness_weight == weight) {
+        return;
+    }
+    m_uphill_steepness_weight = weight;
+    emit optimisation_parameters_changed();
+}
+
+int PlannerModel::uphill_penalty() const { return m_uphill_penalty; }
+
+void PlannerModel::set_uphill_penalty(int penalty)
+{
+    if (m_uphill_penalty == penalty) {
+        return;
+    }
+    m_uphill_penalty = penalty;
     emit optimisation_parameters_changed();
 }
 
@@ -176,9 +229,24 @@ bool PlannerModel::route_line_visible() const { return m_route_line_visible; }
 
 QVariantList PlannerModel::elevation_profile() const
 {
+    // the chart cannot display more entries than it has pixels: very long
+    // lines are resampled down (at most k_profile_max_entries variant maps
+    // are ever built, so the gui never churns through tens of thousands of
+    // them per update)
+    constexpr int k_profile_max_entries = 300;
     QVariantList profile;
     double distance = 0.0;
     const nucleus::track::Point* previous = nullptr;
+    int index = 0;
+    int next_sample = 0;
+    double resample_step = 0.0;
+    int total_points = 0;
+    for (const auto& segment : m_render_line.track) {
+        total_points += int(segment.size());
+    }
+    if (total_points > k_profile_max_entries) {
+        resample_step = double(total_points - 1) / double(k_profile_max_entries - 1);
+    }
     for (const auto& segment : m_render_line.track) {
         for (const auto& point : segment) {
             double slope_degrees = 0.0;
@@ -192,17 +260,21 @@ QVariantList PlannerModel::elevation_profile() const
                 }
                 slope_degrees = glm::degrees(std::atan2(dz, horizontal));
             }
-            profile.append(QVariantMap {
-                { "x", distance },
-                { "y", point.elevation },
-                { "slope", slope_degrees },
-            });
+            if (resample_step <= 0.0 || index >= next_sample || index + 1 == total_points) {
+                profile.append(QVariantMap {
+                    { "x", distance },
+                    { "y", point.elevation },
+                    { "slope", slope_degrees },
+                });
+                next_sample = int(std::round(double(profile.size()) * resample_step));
+            }
             if (previous) {
                 const nucleus::track::Point from = { previous->latitude, previous->longitude, 0.0 };
                 const nucleus::track::Point to = { point.latitude, point.longitude, 0.0 };
                 distance += m_plan.haversine_distance(from, to);
             }
             previous = &point;
+            index += 1;
         }
     }
     return profile;
@@ -218,6 +290,25 @@ void PlannerModel::set_route_line_visible(bool visible)
 }
 
 QString PlannerModel::status() const { return m_status; }
+
+bool PlannerModel::route_dirty() const { return m_route_dirty; }
+
+void PlannerModel::mark_plan_dirty()
+{
+    if (m_route_dirty) {
+        return;
+    }
+    m_route_dirty = true;
+    emit route_dirty_changed();
+}
+
+void PlannerModel::set_transient_status(const QString& text)
+{
+    m_transient_status = text;
+    m_status = text;
+    emit status_changed();
+    m_status_timer.start();
+}
 
 void PlannerModel::invalidate_optimisation()
 {
@@ -269,8 +360,162 @@ std::vector<glm::dvec2> PlannerModel::waypoint_sequence() const
     return sequence;
 }
 
-void PlannerModel::add_point_at(double latitude, double longitude, double altitude)
+PlannerModel::NearestRoute PlannerModel::nearest_route_geometry(double latitude, double longitude) const
 {
+    NearestRoute result;
+    result.point_distance = std::numeric_limits<double>::max();
+    const glm::dvec2 world = nucleus::srs::lat_long_to_world({ latitude, longitude });
+
+    int flat_index = 0;
+    for (const auto& segment : m_plan.track) {
+        for (const auto& point : segment) {
+            const glm::dvec2 point_world = nucleus::srs::lat_long_to_world({ point.latitude, point.longitude });
+            const double point_distance = glm::length(point_world - world);
+            if (point_distance < result.point_distance) {
+                result.point_distance = point_distance;
+                result.nearest_point = flat_index;
+            }
+            flat_index += 1;
+        }
+    }
+    return result;
+}
+
+int PlannerModel::nearest_render_pair(double latitude, double longitude, double* out_distance) const
+{
+    static const double no_distance = std::numeric_limits<double>::max();
+    if (out_distance) {
+        *out_distance = no_distance;
+    }
+    const int point_count = int(m_render_line.point_count());
+    if (point_count < 2 || int(m_render_line_pair_indices.size()) < point_count) {
+        return -1;
+    }
+    const glm::dvec2 world = nucleus::srs::lat_long_to_world({ latitude, longitude });
+    double best_distance = no_distance;
+    int best_pair = -1;
+    for (int j = 0; j + 1 < point_count; ++j) {
+        const glm::dvec2 a = nucleus::srs::lat_long_to_world(
+            { m_render_line.track.front()[size_t(j)].latitude, m_render_line.track.front()[size_t(j)].longitude });
+        const glm::dvec2 b = nucleus::srs::lat_long_to_world(
+            { m_render_line.track.front()[size_t(j + 1)].latitude, m_render_line.track.front()[size_t(j + 1)].longitude });
+        const glm::dvec2 ab = b - a;
+        const double ab_length_sq = glm::dot(ab, ab);
+        const double t = ab_length_sq > 0.0
+            ? std::clamp(glm::dot(world - a, ab) / ab_length_sq, 0.0, 1.0)
+            : 0.0;
+        const double distance = glm::length(world - (a + ab * t));
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_pair = m_render_line_pair_indices[size_t(j)];
+        }
+    }
+    if (out_distance) {
+        *out_distance = best_distance == no_distance ? 0.0 : best_distance;
+    }
+    return best_pair;
+}
+
+void PlannerModel::insert_pairs_at(unsigned pair_index)
+{
+    // inserting a waypoint between waypoints pair_index and pair_index + 1
+    // replaces that cached pair with two new (uncached) pairs; appending
+    // after the last waypoint only adds one. emplace, not insert(pos, {}):
+    // the braces bind to vector's initializer_list overload, which inserts
+    // an empty list - i.e. nothing
+    if (pair_index < m_optimised_segments.size()) {
+        m_optimised_segments.erase(m_optimised_segments.begin() + long(pair_index));
+        m_optimised_segments.emplace(m_optimised_segments.begin() + long(pair_index));
+        m_optimised_segments.emplace(m_optimised_segments.begin() + long(pair_index) + 1);
+    } else {
+        const auto at = m_optimised_segments.begin()
+            + long(std::min<size_t>(pair_index, m_optimised_segments.size()));
+        m_optimised_segments.emplace(at);
+    }
+}
+
+void PlannerModel::insert_waypoint(double latitude, double longitude, double altitude, int after_index)
+{
+    if (after_index < 0 || after_index >= int(m_plan.point_count())) {
+        return;
+    }
+    m_plan.insert_point(unsigned(after_index) + 1, { latitude, longitude, altitude });
+    insert_pairs_at(unsigned(after_index));
+    if (m_optimised_segments.size() + 1 != m_plan.point_count()) {
+        // the cache must hold one entry per waypoint pair; this guards the
+        // insert path that silently no-op'ed once
+        qWarning() << "PLANNER: optimised cache size" << m_optimised_segments.size()
+                   << "does not match plan pairs" << m_plan.point_count() - 1 << "- clearing";
+        m_optimised_segments.clear();
+    }
+    m_plan.recompute_stats();
+    drop_inflight_result();
+    clear_status();
+    update_render_data();
+    mark_plan_dirty();
+    emit points_changed();
+}
+
+void PlannerModel::press_at(double latitude, double longitude)
+{
+    const NearestRoute near = nearest_route_geometry(latitude, longitude);
+    if (near.point_distance <= k_point_grab_radius) {
+        // dragging starts immediately (no hold delay); camera navigation is
+        // suppressed until the pointer is released
+        m_drag_point = near.nearest_point;
+        m_dragging = true;
+        emit route_point_dragging_changed(true);
+    }
+}
+
+void PlannerModel::move_dragged(double latitude, double longitude, double altitude)
+{
+    if (!m_dragging || m_drag_point < 0) {
+        return;
+    }
+    m_plan.update_point(unsigned(m_drag_point), { latitude, longitude, altitude });
+    if (m_drag_point > 0) {
+        clear_optimised_segment(unsigned(m_drag_point) - 1);
+    }
+    clear_optimised_segment(unsigned(m_drag_point));
+    mark_plan_dirty();
+    update_render_data();
+}
+
+void PlannerModel::release_at()
+{
+    if (!m_dragging) {
+        return;
+    }
+    m_dragging = false;
+    m_drag_point = -1;
+    m_plan.recompute_stats();
+    emit route_point_dragging_changed(false);
+    emit points_changed();
+}
+
+void PlannerModel::add_point_at(double latitude, double longitude, double altitude, double screen_x, double screen_y)
+{
+    const NearestRoute near = nearest_route_geometry(latitude, longitude);
+    if (near.point_distance <= k_point_grab_radius) {
+        // clicked onto an existing point: press it to move it, a plain click
+        // does nothing
+        return;
+    }
+    // the insertion decision measures against the RENDERED line: on an
+    // optimised route it follows the a* paths, which stray far from the
+    // plan's straight chords - measuring against the chords would silently
+    // append the clicked waypoint at the route's end instead
+    double render_distance = 0;
+    const int render_pair = nearest_render_pair(latitude, longitude, &render_distance);
+    if (render_pair >= 0 && render_distance <= k_waypoint_insert_radius) {
+        // clicked onto the rendered route line: ask whether a waypoint
+        // should be created at that position, inserted into the clicked
+        // waypoint pair
+        emit waypoint_insertion_requested(latitude, longitude, altitude, render_pair, screen_x, screen_y);
+        return;
+    }
+
     m_plan.add_new_point({ latitude, longitude, altitude });
     m_plan.recompute_stats();
     // appending a point adds one new waypoint pair; the optimised paths of
@@ -279,6 +524,7 @@ void PlannerModel::add_point_at(double latitude, double longitude, double altitu
     drop_inflight_result();
     clear_status();
     update_render_data();
+    mark_plan_dirty();
     emit points_changed();
 }
 
@@ -314,6 +560,7 @@ void PlannerModel::delete_point(int index)
     drop_inflight_result();
     clear_status();
     update_render_data();
+    mark_plan_dirty();
     emit points_changed();
 }
 
@@ -335,6 +582,7 @@ void PlannerModel::move_point_up(int index)
     drop_inflight_result();
     clear_status();
     update_render_data();
+    mark_plan_dirty();
     emit points_changed();
 }
 
@@ -356,14 +604,17 @@ void PlannerModel::move_point_down(int index)
     drop_inflight_result();
     clear_status();
     update_render_data();
+    mark_plan_dirty();
     emit points_changed();
 }
 
 void PlannerModel::reset()
 {
     m_plan.reset();
+    m_route_imported = false;
     invalidate_optimisation();
     update_render_data();
+    mark_plan_dirty();
     emit points_changed();
     emit name_changed();
     emit description_changed();
@@ -376,8 +627,10 @@ void PlannerModel::export_gpx(const QUrl& file_url)
         return;
     }
     // when an optimised route exists, export the dense computed line (the
-    // route that is rendered), otherwise the clicked waypoint plan
-    nucleus::track::Gpx route = !m_optimised_segments.empty() ? m_render_line : m_plan;
+    // route that is rendered), otherwise the clicked waypoint plan. imported
+    // routes always export their full original track: the rendered line is
+    // only a light skeleton
+    nucleus::track::Gpx route = (!m_optimised_segments.empty() && !m_route_imported) ? m_render_line : m_plan;
     route.creationDateTime = QDateTime::currentDateTime();
     // android file dialogs return content:// uris, which QFile can open but
     // which have no local file path
@@ -388,21 +641,33 @@ void PlannerModel::export_gpx(const QUrl& file_url)
     }
 }
 
-void PlannerModel::import_gpx(const QUrl& file_url)
+bool PlannerModel::import_gpx(const QUrl& file_url)
 {
     const QString path = file_url.isLocalFile() ? file_url.toLocalFile() : file_url.toString();
     if (path.isEmpty()) {
         qWarning() << "PlannerModel::import_gpx: not a local file" << file_url;
         m_status = tr("Could not open the selected file");
         emit status_changed();
-        return;
+        return false;
     }
+    if (load_gpx_file(path, QFileInfo(path).completeBaseName())) {
+        // imported routes are saved automatically under their name (an
+        // existing route of the same name is not overwritten, the name gets
+        // a counter)
+        save_route(m_plan.name);
+        return true;
+    }
+    return false;
+}
+
+bool PlannerModel::load_gpx_file(const QString& path, const QString& fallback_name)
+{
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        qWarning() << "PlannerModel::import_gpx: failed to open file!" << path;
+        qWarning() << "PlannerModel: failed to open file!" << path;
         m_status = tr("Could not open the selected file");
         emit status_changed();
-        return;
+        return false;
     }
 
     QXmlStreamReader xml_reader(&file);
@@ -410,27 +675,28 @@ void PlannerModel::import_gpx(const QUrl& file_url)
     file.close();
 
     if (gpx == nullptr) {
-        qWarning() << "PlannerModel::import_gpx: could not parse GPX file!" << path;
+        qWarning() << "PlannerModel: could not parse GPX file!" << path;
         m_status = tr("Could not parse the GPX file");
         emit status_changed();
-        return;
+        return false;
     }
     if (gpx->point_count() == 0) {
         m_status = tr("The GPX file contains no track points");
         emit status_changed();
-        return;
+        return false;
     }
 
-    // the imported track becomes the editable plan (replaces the current one).
-    // the planner edits one continuous leg and lists the points flat, so
+    // the track becomes the editable plan (replaces the current one). the
+    // planner edits one continuous leg and lists the points flat, so
     // multi-segment tracks are merged into a single segment: that keeps the
     // ui indices, the optimiser's pair numbering and the rendered line
     // consistent (segments of a gpx file are not connected, but a planned
     // route continues across former leg boundaries)
     m_plan = std::move(*gpx);
     m_plan.flatten_segments();
+    m_route_imported = true;
     if (m_plan.name.isEmpty()) {
-        m_plan.name = QFileInfo(path).completeBaseName();
+        m_plan.name = fallback_name;
     }
     m_plan.recompute_stats();
     invalidate_optimisation();
@@ -440,14 +706,111 @@ void PlannerModel::import_gpx(const QUrl& file_url)
     emit name_changed();
     emit description_changed();
 
-    // move the camera to the start of the imported track, like the track
-    // upload button does
+    // move the camera to the start of the track, like the track upload
+    // button does
     for (const auto& segment : m_plan.track) {
         if (segment.empty()) {
             continue;
         }
         emit track_imported({ segment.front().latitude, segment.front().longitude });
         break;
+    }
+    return true;
+}
+
+QVariantList PlannerModel::saved_routes() const
+{
+    QVariantList list;
+    const QDir dir(routes_directory());
+    for (const QFileInfo& entry : dir.entryInfoList({ QStringLiteral("*.gpx") }, QDir::Files, QDir::Name)) {
+        QFile file(entry.absoluteFilePath());
+        if (!file.open(QIODevice::ReadOnly)) {
+            continue;
+        }
+        QXmlStreamReader xml_reader(&file);
+        std::unique_ptr<nucleus::track::Gpx> gpx = nucleus::track::parse(xml_reader);
+        file.close();
+        if (gpx == nullptr) {
+            continue;
+        }
+        gpx->recompute_stats();
+        list.append(QVariantMap {
+            { "file", entry.fileName() },
+            { "name", gpx->name.isEmpty() ? entry.completeBaseName() : gpx->name },
+            { "points", gpx->point_count() },
+            { "distance", gpx->distance },
+        });
+    }
+    return list;
+}
+
+void PlannerModel::save_route(const QString& name)
+{
+    if (m_plan.point_count() == 0) {
+        m_status = tr("Nothing to save");
+        emit status_changed();
+        return;
+    }
+    // the route name doubles as the file name; anything the file system
+    // would not like becomes an underscore
+    QString clean_name;
+    for (const QChar& character : name) {
+        clean_name.append(character.isLetterOrNumber() || character == ' ' || character == '-' || character == '_'
+            ? character : QChar('_'));
+    }
+    clean_name = clean_name.trimmed();
+    if (clean_name.isEmpty()) {
+        clean_name = QStringLiteral("route");
+    }
+
+    // never overwrite another route: extend the name with a counter until
+    // the file name is free ("Haidenspitze", "Haidenspitze 2", ...)
+    const QDir dir(routes_directory());
+    dir.mkpath(QStringLiteral("."));
+    QString used_name = clean_name;
+    int counter = 2;
+    while (QFileInfo::exists(dir.filePath(used_name + QStringLiteral(".gpx")))) {
+        used_name = clean_name + QLatin1Char(' ') + QString::number(counter++);
+    }
+
+    nucleus::track::Gpx route = m_plan;
+    route.name = used_name;
+    route.creationDateTime = QDateTime::currentDateTime();
+    if (route.save(dir.filePath(used_name + QStringLiteral(".gpx")))) {
+        set_transient_status(tr("Route saved"));
+        emit saved_routes_changed();
+        if (m_route_dirty) {
+            m_route_dirty = false;
+            emit route_dirty_changed();
+        }
+    } else {
+        m_status = tr("Could not save the route");
+        emit status_changed();
+    }
+}
+
+bool PlannerModel::load_route(const QString& file_name)
+{
+    if (file_name.contains('/') || file_name.startsWith('.')) {
+        return false;
+    }
+    if (!load_gpx_file(routes_directory() + QLatin1Char('/') + file_name, QFileInfo(file_name).completeBaseName())) {
+        return false;
+    }
+    if (m_route_dirty) {
+        m_route_dirty = false;
+        emit route_dirty_changed();
+    }
+    return true;
+}
+
+void PlannerModel::delete_route(const QString& file_name)
+{
+    if (file_name.contains('/') || file_name.startsWith('.')) {
+        return;
+    }
+    if (QFile::remove(routes_directory() + QLatin1Char('/') + file_name)) {
+        emit saved_routes_changed();
     }
 }
 
@@ -469,8 +832,10 @@ void PlannerModel::optimise_route()
 
     nucleus::planner::OptimisationWeights weights;
     weights.steepness = m_steepness_weight;
+    weights.uphill_steepness = m_uphill_steepness_weight;
     weights.distance = m_distance_weight;
     weights.cross_slope = m_cross_slope_weight;
+    weights.uphill_penalty = m_uphill_penalty / 10.0;
     weights.search_padding = m_search_radius / 100.0;
 
     auto* session = new nucleus::planner::RouteOptimisationSession(waypoints, weights, this);
@@ -506,6 +871,7 @@ void PlannerModel::undo_last_point()
     drop_inflight_result();
     clear_status();
     update_render_data();
+    mark_plan_dirty();
     emit points_changed();
 }
 
@@ -599,6 +965,10 @@ namespace {
 
 struct RenderData {
     nucleus::track::Gpx line;
+    // the waypoint pair each line point belongs to (parallel to the line
+    // points), so clicks on the rendered line can be tied back to a plan
+    // pair even when optimised paths stray from the straight chords
+    std::vector<int> line_pair_indices;
     nucleus::track::Gpx markers;
     double avg_steepness = 0;
     double max_steepness = 0;
@@ -614,6 +984,10 @@ RenderData compute_render_data(const nucleus::track::Gpx& plan,
 {
     RenderData result;
 
+    // recorded tracks carry thousands of points; the per-point markers are
+    // only useful for hand-planned routes and would drown the map otherwise
+    const bool with_markers = int(plan.point_count()) <= k_marker_point_limit;
+
     // accumulates steepness statistics along the rendered line. called for
     // every point appended to the line, in order; the chain restarts at each
     // plan segment (segments are not connected to each other)
@@ -621,7 +995,7 @@ RenderData compute_render_data(const nucleus::track::Gpx& plan,
     double total_distance = 0;
     bool chain_started = false;
     nucleus::track::Point chain_previous {};
-    const auto add_line_point = [&](const nucleus::track::Point& point) {
+    const auto add_line_point = [&](const nucleus::track::Point& point, int pair_index) {
         if (chain_started) {
             const double dist = plan.haversine_distance(chain_previous, point);
             if (dist > 0) {
@@ -635,6 +1009,7 @@ RenderData compute_render_data(const nucleus::track::Gpx& plan,
         }
         chain_previous = point;
         result.line.add_new_point(point);
+        result.line_pair_indices.push_back(pair_index);
     };
     const auto restart_chain = [&chain_started]() { chain_started = false; };
 
@@ -649,17 +1024,22 @@ RenderData compute_render_data(const nucleus::track::Gpx& plan,
         // collect the interpolated samples of this plan segment, then smooth
         // their elevations, so that the rendered steepness changes gradually
         std::vector<nucleus::track::Point> line_points;
+        std::vector<int> line_point_pairs;
         line_points.reserve(segment.size() * 8);
         for (size_t i = 0; i < segment.size(); ++i) {
             const nucleus::track::Point& a = segment[i];
+            const size_t current_pair = pair_index;
             line_points.push_back(a);
+            line_point_pairs.push_back(int(current_pair));
 
             // point marker: ~1 m segment that the capsule shader renders as a
             // round dot sitting on the route point
-            const double lat_offset = k_marker_length / k_metres_per_degree_latitude;
-            result.markers.add_new_segment();
-            result.markers.add_new_point({ a.latitude - lat_offset / 2.0, a.longitude, a.elevation });
-            result.markers.add_new_point({ a.latitude + lat_offset / 2.0, a.longitude, a.elevation });
+            if (with_markers) {
+                const double lat_offset = k_marker_length / k_metres_per_degree_latitude;
+                result.markers.add_new_segment();
+                result.markers.add_new_point({ a.latitude - lat_offset / 2.0, a.longitude, a.elevation });
+                result.markers.add_new_point({ a.latitude + lat_offset / 2.0, a.longitude, a.elevation });
+            }
 
             if (i + 1 >= segment.size()) {
                 continue;
@@ -711,11 +1091,21 @@ RenderData compute_render_data(const nucleus::track::Gpx& plan,
             // is appended by the next loop iteration (or as the segment end)
             for (size_t k = 0; k + 1 < path->size(); ++k) {
                 line_points.push_back((*path)[k]);
+                line_point_pairs.push_back(int(current_pair));
             }
         }
 
-        // moving average over the sampled elevations (route points keep their
-        // exact elevation at the segment ends)
+        // pin every line point to the displayed terrain: imported tracks carry
+        // elevations from a different height model and would float above or
+        // sink into the dem. re-sampling the interior points is idempotent
+        // (they were dem-sampled above); the waypoints pick up the dem as well
+        for (auto& point : line_points) {
+            if (const auto alt = sampler.altitude({ point.latitude, point.longitude })) {
+                point.elevation = alt.value();
+            }
+        }
+
+        // moving average over the sampled elevations
         const int radius = k_elevation_smoothing_radius;
         for (size_t i = radius; i + radius < line_points.size(); ++i) {
             double sum = 0;
@@ -725,8 +1115,8 @@ RenderData compute_render_data(const nucleus::track::Gpx& plan,
             line_points[i].elevation = sum / double(2 * radius + 1);
         }
 
-        for (const nucleus::track::Point& point : line_points) {
-            add_line_point(point);
+        for (size_t j = 0; j < line_points.size(); ++j) {
+            add_line_point(line_points[j], line_point_pairs[j]);
         }
     }
 
@@ -744,6 +1134,7 @@ void PlannerModel::update_render_data()
     if (m_plan.point_count() == 0) {
         m_render_data_generation += 1; // discard an in-flight computation
         m_render_line = {};
+        m_render_line_pair_indices.clear();
         m_render_markers = {};
         m_avg_steepness = 0;
         m_max_steepness = 0;
@@ -778,6 +1169,7 @@ void PlannerModel::update_render_data()
             }
             const RenderData& result = watcher->result();
             m_render_line = result.line;
+            m_render_line_pair_indices = result.line_pair_indices;
             m_render_markers = result.markers;
             m_avg_steepness = result.avg_steepness;
             m_max_steepness = result.max_steepness;
@@ -789,6 +1181,7 @@ void PlannerModel::update_render_data()
     Q_UNUSED(generation);
     const RenderData result = compute_job();
     m_render_line = result.line;
+    m_render_line_pair_indices = result.line_pair_indices;
     m_render_markers = result.markers;
     m_avg_steepness = result.avg_steepness;
     m_max_steepness = result.max_steepness;

@@ -40,6 +40,11 @@ Rectangle {
     property bool minimized: false
     property bool preview_running: false
 
+    // the editor opens on the saved-routes overview; the planner panel is
+    // shown for a new, imported or loaded route
+    property bool show_routes: true
+    onShow_routesChanged: map.change_edit_mode(!show_routes)
+
     // optimisation weight sliders, collapsed behind the chevron by default
     property bool weights_visible: false
 
@@ -47,9 +52,52 @@ Rectangle {
         return d < 1000 ? d.toFixed(0) + " m" : (d / 1000).toFixed(2) + " km";
     }
 
-    // start minimized on narrow screens (phone portrait), where the expanded
-    // panel would cover the whole map
-    Component.onCompleted: minimized = gpx_root.width < 500
+    // pending waypoint insertion (map click on the route line): a small
+    // button floats above the click position; any press outside of it
+    // cancels without adding a point
+    property bool waypoint_insertion_active: false
+    property double pending_latitude: 0
+    property double pending_longitude: 0
+    property double pending_altitude: 0
+    property int pending_after_index: -1
+
+    function request_waypoint_insertion(latitude, longitude, altitude, after_index, screen_x, screen_y) {
+        pending_latitude = latitude;
+        pending_longitude = longitude;
+        pending_altitude = altitude;
+        pending_after_index = after_index;
+        const button_width = waypoint_add_button.width > 0 ? waypoint_add_button.width : 110;
+        const button_height = waypoint_add_button.height > 0 ? waypoint_add_button.height : 36;
+        // high enough above the click position that a finger on a
+        // touchscreen does not cover the button
+        const gap = 60;
+        waypoint_add_button.x = Math.max(8, Math.min(screen_x - button_width / 2, gpx_root.width - button_width - 8));
+        waypoint_add_button.y = screen_y - button_height - gap;
+        if (waypoint_add_button.y < 8) {
+            waypoint_add_button.y = Math.min(screen_y + gap, gpx_root.height - button_height - 8);
+        }
+        waypoint_insertion_active = true;
+    }
+
+    function cancel_waypoint_insertion() {
+        waypoint_insertion_active = false;
+    }
+
+    // leave the overview and open the planner panel; start minimized on
+    // narrow screens (phone portrait), where the expanded panel would cover
+    // the whole map
+    function open_planner() {
+        show_routes = false;
+        minimized = gpx_root.width < 500;
+    }
+
+    // continue planning when re-opened with a route in progress; the routes
+    // overview (which accepts no map clicks) only shows for an empty plan
+    Component.onCompleted: {
+        show_routes = _planner_model.point_count === 0;
+        minimized = !show_routes && gpx_root.width < 500;
+        map.change_edit_mode(!show_routes);
+    }
 
     // react to the camera fly-through preview: hide the whole widget once on
     // start (not on every progress update), disable adding points, restore
@@ -66,9 +114,34 @@ Rectangle {
                 gpx_root.visible = true;
                 // only re-enable point picking if the editor page is still open
                 if (main.selectedPage === "gpxeditor") {
-                    map.change_edit_mode(true);
+                    map.change_edit_mode(!gpx_root.show_routes);
                 }
             }
+        }
+    }
+
+    // full-window press catcher: while the add-waypoint button is up, any
+    // press outside of it cancels the insertion without adding a point
+    MouseArea {
+        visible: gpx_root.waypoint_insertion_active
+        enabled: gpx_root.waypoint_insertion_active
+        anchors.fill: parent
+        z: 90
+        onPressed: function(mouse) {
+            gpx_root.cancel_waypoint_insertion();
+            mouse.accepted = true;
+        }
+    }
+
+    Button {
+        id: waypoint_add_button
+        visible: gpx_root.waypoint_insertion_active
+        z: 91
+        text: qsTr("Add waypoint")
+        font.bold: true
+        onClicked: {
+            _planner_model.insert_waypoint(pending_latitude, pending_longitude, pending_altitude, pending_after_index);
+            gpx_root.cancel_waypoint_insertion();
         }
     }
 
@@ -87,7 +160,12 @@ Rectangle {
         title: qsTr("Import GPX track")
         nameFilters: ["GPX (*.gpx *.xml)"]
         fileMode: FileDialog.OpenFile
-        onAccepted: _planner_model.import_gpx(import_dialog.selectedFile)
+        onAccepted: {
+            // only leave the overview when the file actually parsed
+            if (_planner_model.import_gpx(import_dialog.selectedFile) && gpx_root.show_routes) {
+                gpx_root.open_planner()
+            }
+        }
     }
 
     Rectangle {
@@ -106,11 +184,135 @@ Rectangle {
 
         Behavior on height { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
 
+        // saved routes overview: the editor's entry view
+        ColumnLayout {
+            id: routes_view
+            visible: gpx_root.show_routes
+            anchors.fill: parent
+            spacing: 8
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 10
+                Layout.leftMargin: 10
+                Layout.rightMargin: 10
+
+                Label {
+                    text: qsTr("Saved Routes")
+                    font.bold: true
+                    font.pointSize: 16
+                    Layout.fillWidth: true
+                }
+                // mirror of the planner's back button: switches to the
+                // planner while a route is in progress
+                ToolButton {
+                    visible: _planner_model.point_count > 0
+                    text: "›"
+                    onClicked: gpx_root.open_planner()
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Continue editing the current route")
+                }
+                ToolButton {
+                    text: "×"
+                    onClicked: gpx_root.closeRequested()
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Close the route planner")
+                }
+            }
+
+            Label {
+                visible: _planner_model.saved_routes.length === 0
+                text: qsTr("No saved routes yet")
+                opacity: 0.7
+                Layout.fillWidth: true
+                Layout.leftMargin: 10
+                Layout.rightMargin: 10
+            }
+
+            ListView {
+                id: saved_routes_list
+                model: _planner_model.saved_routes
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                spacing: 2
+                boundsBehavior: Flickable.StopAtBounds
+
+                ScrollBar.vertical: ScrollBar {
+                    policy: saved_routes_list.contentHeight > saved_routes_list.height
+                        ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                }
+
+                delegate: RowLayout {
+                    width: saved_routes_list.width
+
+                    ItemDelegate {
+                        Layout.fillWidth: true
+                        onClicked: {
+                            if (_planner_model.load_route(modelData.file)) {
+                                gpx_root.open_planner()
+                            }
+                        }
+                        contentItem: ColumnLayout {
+                            spacing: 0
+                            Label {
+                                text: modelData.name
+                                font.bold: true
+                                elide: Text.ElideRight
+                            }
+                            Label {
+                                text: modelData.points + " points | " + format_distance(modelData.distance)
+                                font.pointSize: 11
+                                opacity: 0.7
+                                elide: Text.ElideRight
+                            }
+                        }
+                    }
+                    ToolButton {
+                        text: "×"
+                        onClicked: _planner_model.delete_route(modelData.file)
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Delete this route")
+                    }
+                }
+            }
+
+            Label {
+                visible: _planner_model.status !== ""
+                text: _planner_model.status
+                wrapMode: Label.Wrap
+                Layout.fillWidth: true
+                Layout.leftMargin: 10
+                Layout.rightMargin: 10
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.leftMargin: 10
+                Layout.rightMargin: 10
+                Layout.bottomMargin: 10
+
+                Button {
+                    text: qsTr("Create New")
+                    Layout.fillWidth: true
+                    onClicked: {
+                        _planner_model.reset()
+                        gpx_root.open_planner()
+                    }
+                }
+                Button {
+                    text: qsTr("Import GPX")
+                    Layout.fillWidth: true
+                    onClicked: import_dialog.open()
+                }
+            }
+        }
+
         // scrollable body: on small screens the content is taller than the
         // panel, and the buttons at the bottom must stay reachable
         Flickable {
             id: panel_scroll
-            visible: !gpx_root.minimized
+            visible: !gpx_root.show_routes && !gpx_root.minimized
             anchors.fill: parent
             contentHeight: content_column.implicitHeight
             clip: true
@@ -132,6 +334,12 @@ Rectangle {
                     Layout.leftMargin: 10
                     Layout.rightMargin: 10
 
+                    ToolButton {
+                        text: "‹"
+                        onClicked: gpx_root.show_routes = true
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Back to saved routes")
+                    }
                     Label {
                         text: qsTr("Route Planner")
                         font.bold: true
@@ -171,7 +379,7 @@ Rectangle {
                 }
 
                 Label {
-                    text: _planner_model.points.length + " points | "
+                    text: _planner_model.point_count + " points | "
                           + format_distance(_planner_model.distance) + " | ↑ "
                           + _planner_model.ascent.toFixed(0) + " m | ↓ "
                           + _planner_model.descent.toFixed(0) + " m"
@@ -223,13 +431,13 @@ Rectangle {
 
                     Button {
                         text: _planner_model.optimisation_running ? qsTr("Optimizing…") : qsTr("Optimize Route")
-                        enabled: _planner_model.points.length >= 2 && !_planner_model.optimisation_running
+                        enabled: _planner_model.point_count >= 2 && !_planner_model.optimisation_running
                         onClicked: _planner_model.optimise_route()
                         Layout.fillWidth: true
                     }
                     Button {
                         text: qsTr("Fly Route")
-                        enabled: _planner_model.points.length >= 2
+                        enabled: _planner_model.point_count >= 2
                         onClicked: {
                             _planner_model.fill_preview_route()
                             map.start_route_preview()
@@ -252,7 +460,33 @@ Rectangle {
                     stepSize: 1
                     value: _planner_model.steepness_weight
                     onMoved: _planner_model.steepness_weight = value
-                    formatCallback: function(value) { return qsTr("slope ") + value.toFixed(0) + "%"; }
+                    formatCallback: function(value) { return qsTr("slope ↓ ") + value.toFixed(0) + "%"; }
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 10
+                    Layout.rightMargin: 10
+                }
+
+                LabledSlider {
+                    visible: gpx_root.weights_visible
+                    from: 0
+                    to: 100
+                    stepSize: 1
+                    value: _planner_model.uphill_steepness_weight
+                    onMoved: _planner_model.uphill_steepness_weight = value
+                    formatCallback: function(value) { return qsTr("slope ↑ ") + value.toFixed(0) + "%"; }
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 10
+                    Layout.rightMargin: 10
+                }
+
+                LabledSlider {
+                    visible: gpx_root.weights_visible
+                    from: 0
+                    to: 100
+                    stepSize: 5
+                    value: _planner_model.uphill_penalty
+                    onMoved: _planner_model.uphill_penalty = value
+                    formatCallback: function(value) { return qsTr("climb ") + (value / 10).toFixed(1); }
                     Layout.fillWidth: true
                     Layout.leftMargin: 10
                     Layout.rightMargin: 10
@@ -308,9 +542,12 @@ Rectangle {
 
                 ListView {
                     id: point_list
-                    model: _planner_model.points
+                    // recorded tracks carry thousands of points; the editable
+                    // point list is only shown for hand-planned routes
+                    visible: !_planner_model.route_imported
+                    model: visible ? _planner_model.points : 0
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(contentHeight, 220)
+                    Layout.preferredHeight: visible ? Math.min(contentHeight, 220) : 0
                     Layout.leftMargin: 10
                     Layout.rightMargin: 10
                     spacing: 2
@@ -336,7 +573,7 @@ Rectangle {
                         }
                         ToolButton {
                             text: "▼"
-                            enabled: index < _planner_model.points.length - 1
+                            enabled: index < _planner_model.point_count - 1
                             onClicked: _planner_model.move_point_down(index)
                             ToolTip.visible: hovered
                             ToolTip.text: qsTr("Move point down")
@@ -379,8 +616,12 @@ Rectangle {
                     Layout.bottomMargin: 10
 
                     Button {
-                        text: qsTr("Import GPX")
-                        onClicked: import_dialog.open()
+                        text: qsTr("Save")
+                        enabled: _planner_model.route_dirty
+                        Layout.fillWidth: true
+                        onClicked: _planner_model.save_route(_planner_model.name)
+                        ToolTip.visible: hovered
+                        ToolTip.text: qsTr("Save this route locally")
                     }
                     Button {
                         text: qsTr("Reset")
@@ -388,7 +629,7 @@ Rectangle {
                     }
                     Button {
                         text: qsTr("Export GPX")
-                        enabled: _planner_model.points.length > 0
+                        enabled: _planner_model.point_count > 0
                         onClicked: {
                             // suggest the route name (or "route") as file name
                             const base = _planner_model.name.trim();
@@ -396,7 +637,6 @@ Rectangle {
                             export_dialog.open()
                         }
                     }
-                    Item { Layout.fillWidth: true }
                 }
             }
         }
@@ -420,10 +660,11 @@ Rectangle {
                 if (!description_input.activeFocus)
                     description_input.text = _planner_model.description;
             }
-            // fly to the start of an imported track, like the upload button does
+            // pan to the start of an imported/opened track; the camera
+            // rotation and zoom the user had stay untouched
             function onTrack_imported(position) {
                 if (position.x !== 0 && position.y !== 0)
-                    map.set_position(position.x, position.y)
+                    map.move_position(position.x, position.y)
             }
         }
 
@@ -447,14 +688,14 @@ Rectangle {
             ToolButton {
                 focusPolicy: Qt.NoFocus
                 text: qsTr("Undo")
-                enabled: _planner_model.points.length > 0
+                enabled: _planner_model.point_count > 0
                 onClicked: _planner_model.undo_last_point()
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Delete the last route point")
             }
             ToolButton {
                 text: _planner_model.optimisation_running ? qsTr("…") : qsTr("Optimize")
-                enabled: _planner_model.points.length >= 2 && !_planner_model.optimisation_running
+                enabled: _planner_model.point_count >= 2 && !_planner_model.optimisation_running
                 onClicked: _planner_model.optimise_route()
                 ToolTip.visible: hovered
                 ToolTip.text: qsTr("Optimize the route")

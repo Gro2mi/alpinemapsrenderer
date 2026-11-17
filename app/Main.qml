@@ -251,8 +251,18 @@ Item {
     // route points picked in the gpx editor (map clicks) land in the planner model
     Connections {
         target: map
-        function onPlanner_point_picked(latitude, longitude, altitude) {
-            _planner_model.add_point_at(latitude, longitude, altitude)
+        function onPlanner_point_picked(latitude, longitude, altitude, screenX, screenY) {
+            _planner_model.add_point_at(latitude, longitude, altitude, screenX, screenY)
+        }
+        // hold-to-drag of route points
+        function onPlanner_press_geo(latitude, longitude) {
+            _planner_model.press_at(latitude, longitude)
+        }
+        function onPlanner_move_geo(latitude, longitude, altitude) {
+            _planner_model.move_dragged(latitude, longitude, altitude)
+        }
+        function onPlanner_release() {
+            _planner_model.release_at()
         }
         // the fly bar buttons must not keep the keyboard focus: the arrow
         // keys steer the preview (left/right seek, up/down speed)
@@ -262,6 +272,23 @@ Item {
             speed_combo.currentIndex = speed_combo.index_for(map.preview_speed)
             if (map.preview_active)
                 map.forceActiveFocus()
+        }
+    }
+
+    // signals of the planner model itself (not the map): the waypoint
+    // insertion request and the route point drag state
+    Connections {
+        target: _planner_model
+        // a click landed on the planned route: let the editor ask whether a
+        // waypoint should be created there
+        function onWaypoint_insertion_requested(latitude, longitude, altitude, afterIndex, screenX, screenY) {
+            if (main.selectedPage === "gpxeditor" && main_stack_view.currentItem !== null
+                && main_stack_view.currentItem.request_waypoint_insertion !== undefined) {
+                main_stack_view.currentItem.request_waypoint_insertion(latitude, longitude, altitude, afterIndex, screenX, screenY)
+            }
+        }
+        function onRoute_point_dragging_changed(dragging) {
+            map.planner_drag_active = dragging
         }
     }
 

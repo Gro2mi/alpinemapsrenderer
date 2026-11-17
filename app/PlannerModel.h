@@ -51,14 +51,28 @@ class PlannerModel : public QObject {
     Q_PROPERTY(double max_steepness READ max_steepness NOTIFY render_data_changed)
     // least-cost path optimisation (steep ski descent planning)
     Q_PROPERTY(int steepness_weight READ steepness_weight WRITE set_steepness_weight NOTIFY optimisation_parameters_changed)
+    Q_PROPERTY(int uphill_steepness_weight READ uphill_steepness_weight WRITE set_uphill_steepness_weight NOTIFY optimisation_parameters_changed)
+    Q_PROPERTY(int uphill_penalty READ uphill_penalty WRITE set_uphill_penalty NOTIFY optimisation_parameters_changed)
     Q_PROPERTY(int distance_weight READ distance_weight WRITE set_distance_weight NOTIFY optimisation_parameters_changed)
     Q_PROPERTY(int cross_slope_weight READ cross_slope_weight WRITE set_cross_slope_weight NOTIFY optimisation_parameters_changed)
     // search margin around the route, in percent of the route extent
     Q_PROPERTY(int search_radius READ search_radius WRITE set_search_radius NOTIFY optimisation_parameters_changed)
     Q_PROPERTY(bool optimisation_running READ optimisation_running NOTIFY optimisation_running_changed)
     // one-line status of the editor's long-running or failing operations
-    // (optimisation, gpx import/export); empty = nothing to report
+    // (optimisation, gpx import/export/save); empty = nothing to report.
+    // success messages disappear automatically
     Q_PROPERTY(QString status READ status NOTIFY status_changed)
+    // the routes saved in the app data directory: entries are
+    // { file, name, points, distance }
+    Q_PROPERTY(QVariantList saved_routes READ saved_routes NOTIFY saved_routes_changed)
+    // number of waypoints in the plan (cheap: use this instead of points.length)
+    Q_PROPERTY(int point_count READ point_count NOTIFY points_changed)
+    // true while the current plan comes from an imported gpx: recorded
+    // tracks render without point markers and the editor hides the point
+    // list (thousands of entries would churn the gui)
+    Q_PROPERTY(bool route_imported READ route_imported NOTIFY points_changed)
+    // true when the plan changed since the last save (or was never saved)
+    Q_PROPERTY(bool route_dirty READ route_dirty NOTIFY route_dirty_changed)
     // hides the rendered route *line* between the points (markers stay)
     Q_PROPERTY(bool route_line_visible READ route_line_visible WRITE set_route_line_visible NOTIFY route_line_visible_changed)
     // dense elevation profile of the rendered route line: entries are
@@ -69,6 +83,7 @@ public:
     explicit PlannerModel(QObject* parent = nullptr);
 
     QVariantList points() const;
+    int point_count() const;
     QString name() const;
     void set_name(const QString& new_name);
     QString description() const;
@@ -80,6 +95,10 @@ public:
     double max_steepness() const;
     int steepness_weight() const;
     void set_steepness_weight(int weight);
+    int uphill_steepness_weight() const;
+    void set_uphill_steepness_weight(int weight);
+    int uphill_penalty() const;
+    void set_uphill_penalty(int penalty);
     int distance_weight() const;
     void set_distance_weight(int weight);
     int cross_slope_weight() const;
@@ -88,20 +107,41 @@ public:
     void set_search_radius(int percent);
     bool optimisation_running() const;
     QString status() const;
+    bool route_dirty() const;
     bool route_line_visible() const;
     void set_route_line_visible(bool visible);
     QVariantList elevation_profile() const;
+    // the routes saved in the app data directory: entries are
+    // { file, name, points, distance }
+    QVariantList saved_routes() const;
 
 public slots:
     // geo coordinates in degrees/metres, as reported by the camera depth readback
-    void add_point_at(double latitude, double longitude, double altitude);
+    void add_point_at(double latitude, double longitude, double altitude, double screen_x = 0.0, double screen_y = 0.0);
     void delete_point(int index);
     void move_point_up(int index);
     void move_point_down(int index);
     void reset();
     void export_gpx(const QUrl& file_url);
-    // loads the given gpx file into the planner (replaces the current plan)
-    void import_gpx(const QUrl& file_url);
+    // loads the given gpx file into the planner (replaces the current plan);
+    // false when the file could not be read or parsed
+    bool import_gpx(const QUrl& file_url);
+    // saves the current plan as a gpx file in the app data directory, under
+    // the given name; an existing route of the same name is replaced
+    void save_route(const QString& name);
+    // loads a saved route (file name as listed in saved_routes) into the
+    // planner; false when the file could not be read
+    bool load_route(const QString& file_name);
+    // removes a saved route (file name as listed in saved_routes)
+    void delete_route(const QString& file_name);
+    // gesture callbacks from the map (see TerrainRendererItem): a press near
+    // a route point arms the hold-to-drag, dragging moves the armed point,
+    // releasing ends the drag
+    void press_at(double latitude, double longitude);
+    void move_dragged(double latitude, double longitude, double altitude);
+    void release_at();
+    // inserts a waypoint into the route after the given flat waypoint index
+    void insert_waypoint(double latitude, double longitude, double altitude, int after_index);
     // renders a position indicator at the user's current gnss position.
     // the altitude is only a fallback, the dem altitude is preferred
     void set_user_position(double latitude, double longitude, double altitude);
@@ -129,10 +169,19 @@ signals:
     // emitted after a gpx import, with the lat/long of the first route point,
     // so the ui can move the camera to the imported track
     void track_imported(const QPointF& position);
+    // a click landed close to the planned route: the ui asks whether a
+    // waypoint should be created at that position (inserted into the route
+    // after the given flat waypoint index)
+    void waypoint_insertion_requested(double latitude, double longitude, double altitude, int after_index, double screen_x, double screen_y);
+    // while a route point is dragged, the map must not receive camera
+    // navigation events
+    void route_point_dragging_changed(bool dragging);
     void user_position_changed(const nucleus::track::Gpx& marker);
     void user_position_cleared();
     void optimisation_running_changed();
     void status_changed();
+    void route_dirty_changed();
+    void saved_routes_changed();
     void optimisation_parameters_changed();
     void route_line_visible_changed(bool visible);
 
@@ -152,6 +201,30 @@ private:
     // bump the generation so an in-flight optimisation result is discarded
     void drop_inflight_result();
     void clear_status();
+    // shows a status message that disappears on its own after a few seconds
+    void set_transient_status(const QString& text);
+    // flags the plan as changed since the last save (enables the save button)
+    void mark_plan_dirty();
+    // parses a gpx file and makes it the current plan; false (with a status
+    // message) on failure
+    bool load_gpx_file(const QString& path, const QString& fallback_name);
+    // true while the current plan comes from an imported gpx file
+    bool route_imported() const { return m_route_imported; }
+    // distance (metres) from a position to the nearest route point (with its
+    // flat index), used for the point grab
+    struct NearestRoute {
+        double point_distance = 0;
+        int nearest_point = -1;
+    };
+    NearestRoute nearest_route_geometry(double latitude, double longitude) const;
+    // pair index of the rendered route line segment nearest to the position
+    // (the rendered line follows the optimised paths, which stray from the
+    // plan's straight chords), with its distance in metres; -1 when there is
+    // no rendered line
+    int nearest_render_pair(double latitude, double longitude, double* out_distance) const;
+    // replaces the cached optimised path of the waypoint pair at the given
+    // index with two empty entries (a new waypoint splits the pair)
+    void insert_pairs_at(unsigned pair_index);
     // rebuilds the user position dot from the stored coordinates, re-sampling
     // the dem altitude from the currently cached tiles (connected to the
     // refresh timer, so the dot follows tile refinement)
@@ -178,16 +251,35 @@ private:
     double m_user_position_altitude = 0;
     QTimer m_user_position_timer;
 
+    // drag state of the route points: a press near a point immediately
+    // starts dragging it, releasing ends the drag (camera navigation is
+    // suppressed while it runs)
+    int m_drag_point = -1;
+    bool m_dragging = false;
+    // the waypoint pair each rendered line point belongs to (parallel to the
+    // rendered line points), for placing inserted waypoints on optimised
+    // routes
+    std::vector<int> m_render_line_pair_indices;
+
+    // imported (recorded) routes render as a light skeleton instead of
+    // point-by-point
+    bool m_route_imported = false;
+
     // optimised least-cost descent path per consecutive waypoint pair, kept
     // aligned with the pair numbering of update_render_data after every
     // waypoint edit (empty entries = approximate straight interpolation)
     std::vector<std::vector<nucleus::track::Point>> m_optimised_segments;
     int m_steepness_weight = 60;
+    int m_uphill_steepness_weight = 60;
+    int m_uphill_penalty = 50;
     int m_distance_weight = 40;
     int m_cross_slope_weight = 50;
     int m_search_radius = 20; // percent of the route extent
     bool m_optimisation_running = false;
     QString m_status;
+    QString m_transient_status; // the status text the expiry timer may clear
+    bool m_route_dirty = false;
+    QTimer m_status_timer;
     bool m_route_line_visible = true;
     unsigned m_optimisation_generation = 0;
     // discards results of superseded render-data computations (async, one
