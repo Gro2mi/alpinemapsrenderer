@@ -809,14 +809,23 @@ bool PlannerModel::load_gpx_file(const QString& path, const QString& fallback_na
     emit name_changed();
     emit description_changed();
 
-    // move the camera to the start of the track, like the track upload
-    // button does
+    // frame the whole route: the camera keeps its orientation as much as
+    // possible, the route fits on screen and the camera stays above the dem
+    double min_lat = 90.0, min_lon = 180.0, max_lat = -90.0, max_lon = -180.0;
+    double min_alt = std::numeric_limits<double>::max();
+    double max_alt = std::numeric_limits<double>::lowest();
     for (const auto& segment : m_plan.track) {
-        if (segment.empty()) {
-            continue;
+        for (const auto& point : segment) {
+            min_lat = std::min(min_lat, point.latitude);
+            max_lat = std::max(max_lat, point.latitude);
+            min_lon = std::min(min_lon, point.longitude);
+            max_lon = std::max(max_lon, point.longitude);
+            min_alt = std::min(min_alt, point.elevation);
+            max_alt = std::max(max_alt, point.elevation);
         }
-        emit track_imported({ segment.front().latitude, segment.front().longitude });
-        break;
+    }
+    if (min_alt <= max_alt) {
+        emit route_framing_requested(min_lat, min_lon, max_lat, max_lon, min_alt, max_alt);
     }
     return true;
 }
@@ -902,6 +911,15 @@ bool PlannerModel::load_route(const QString& file_name)
     }
     if (!load_gpx_file(routes_directory() + QLatin1Char('/') + file_name, QFileInfo(file_name).completeBaseName())) {
         return false;
+    }
+    // load_gpx_file flags every load as an imported recorded track, which
+    // hides the editable waypoint list; a saved route is editable when it
+    // is sparse enough to have point markers - only dense recorded tracks
+    // (auto-saved imports) stay flagged
+    const bool dense = m_plan.point_count() > unsigned(k_marker_point_limit);
+    if (m_route_imported != dense) {
+        m_route_imported = dense;
+        emit points_changed(); // route_imported notifies through this
     }
     if (m_route_dirty) {
         m_route_dirty = false;
